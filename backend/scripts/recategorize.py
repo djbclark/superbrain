@@ -393,7 +393,20 @@ def cmd_playlists(args: argparse.Namespace) -> int:
     ) as pool:
         futures = {pool.submit(process_one, url): url for url in pending_urls}
         for fut in as_completed(futures):
-            rec = fut.result()
+            url = futures[fut]
+            try:
+                rec = fut.result()
+            except Exception as exc:
+                # Keep the batch alive; one bad item used to abort the whole run
+                # (e.g. shared SQLite connection InterfaceError under workers>1).
+                with stats_lock:
+                    stats["missing_failed"] += 1
+                rec = {
+                    "url": url,
+                    "error": "worker_exception",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+                print(f"worker error on {url}: {rec['detail']}", flush=True)
             if rec.get("skipped"):
                 continue
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")

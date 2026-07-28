@@ -9,8 +9,10 @@ to re-download or re-transcribe content.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -43,22 +45,74 @@ REFERENCE_FIELDS = (
 
 
 class ReferenceDatabase:
-    """Immutable SQLite view of another SuperBrain analyses table."""
+    """Immutable SQLite view of another SuperBrain analyses table.
+
+    Uses one read-only connection per calling thread so playlist workers can
+    look up rows concurrently without sharing a single sqlite3 connection.
+    """
 
     def __init__(self, db_path: Path | str):
         self.db_path = Path(db_path)
         if not self.db_path.is_file():
             raise FileNotFoundError(f"Reference database not found: {self.db_path}")
+        self._local = threading.local()
+        self._connection_lock = threading.Lock()
+        self._connections: set[sqlite3.Connection] = set()
+        # Eagerly open a connection on the constructing thread so open failures
+        # surface immediately rather than inside a worker.
+        self._connect()
+
+    def _connect(self) -> sqlite3.Connection:
         # Read-only URI keeps us from accidentally writing the reference DB.
         uri = f"file:{self.db_path}?mode=ro"
-        self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=float(os.getenv("DATABASE_TIMEOUT", "30")),
+            # Connections are isolated per thread. Disabling SQLite's ownership
+            # check only lets close() release worker connections after a
+            # ThreadPoolExecutor has shut down.
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            f"PRAGMA busy_timeout={int(float(os.getenv('DATABASE_TIMEOUT', '30')) * 1000)}"
+        )
+        self._local.conn = conn
+        with self._connection_lock:
+            self._connections.add(conn)
+        return conn
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._connect()
+        return conn
+
+    def close_thread_connection(self) -> None:
+        """Close only the calling thread's connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        try:
+            conn.close()
+        finally:
+            with self._connection_lock:
+                self._connections.discard(conn)
+            self._local.conn = None
 
     def close(self) -> None:
-        try:
-            self._conn.close()
-        except Exception:
-            pass
+        """Close every connection created by this ReferenceDatabase instance."""
+        with self._connection_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for conn in connections:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._local.conn = None
 
     def get_by_shortcode(self, shortcode: str) -> Optional[dict]:
         cols = ", ".join(REFERENCE_FIELDS)
@@ -73,8 +127,6 @@ class ReferenceDatabase:
         tags = d.get("tags")
         if tags:
             try:
-                import json
-
                 d["tags"] = json.loads(tags)
             except Exception:
                 d["tags"] = []
@@ -113,9 +165,16 @@ def resolve_analysis_row(
     if row:
         return row, "primary"
     if reference is not None:
-        row = reference.get_by_shortcode(shortcode)
-        if row:
-            return row, "reference"
+        # Same-file primary/reference: primary already missed; skip a second
+        # connection to the identical DB.
+        try:
+            same_file = reference.db_path.resolve() == Path(primary.db_path).resolve()
+        except Exception:
+            same_file = False
+        if not same_file:
+            row = reference.get_by_shortcode(shortcode)
+            if row:
+                return row, "reference"
     return None, "missing"
 
 
