@@ -414,6 +414,38 @@ class ApiService {
     }
   }
 
+  async getTaxonomy(): Promise<{
+    categories: Array<{ id: string; name: string; precedence: number; guidance: string }>;
+    allow_multiple_categories: boolean;
+    fallback_category: string;
+    use_default_categories: boolean;
+  } | null> {
+    try {
+      const headers = await this.getHeaders();
+      const baseUrl = await this.getBaseUrl();
+      const response = await axios.get<{
+        success: boolean;
+        categories: Array<{ id: string; name: string; precedence: number; guidance: string }>;
+        allow_multiple_categories: boolean;
+        fallback_category: string;
+        use_default_categories: boolean;
+      }>(
+        `${baseUrl}/taxonomy`,
+        { headers, timeout: DEFAULT_TIMEOUT }
+      );
+      if (!response.data?.success) return null;
+      return {
+        categories: response.data.categories || [],
+        allow_multiple_categories: !!response.data.allow_multiple_categories,
+        fallback_category: response.data.fallback_category || 'Other',
+        use_default_categories: !!response.data.use_default_categories,
+      };
+    } catch (error) {
+      console.error('Error fetching taxonomy:', error);
+      return null;
+    }
+  }
+
   async checkCache(shortcode: string): Promise<Post | null> {
     try {
       const headers = await this.getHeaders();

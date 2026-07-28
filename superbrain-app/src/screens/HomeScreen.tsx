@@ -203,30 +203,44 @@ const HomeScreen = () => {
 
   const loadCategories = async () => {
     try {
-      const cats = await apiService.getCategories();
-      if (cats && cats.length > 0) {
-        // Always keep full default pill set visible, then overlay live counts from backend.
-        const mergedById = new Map(
-          DEFAULT_CATEGORIES
-            .filter(c => c.id !== 'all')
-            .map(c => [c.id, { ...c, count: 0 }])
-        );
+      const [cats, taxonomy] = await Promise.all([
+        apiService.getCategories(),
+        apiService.getTaxonomy().catch(() => null),
+      ]);
 
-        for (const c of cats) {
-          const id = c.id.toLowerCase();
-          const existing = mergedById.get(id);
-          mergedById.set(id, {
-            id,
-            name: existing?.name || c.name,
-            icon: existing?.icon || CATEGORY_ICONS[c.name.trim().toLowerCase()] || 'pricetag-outline',
-            count: c.count,
-          });
-        }
+      // Prefer configured taxonomy order when available; fall back to app defaults.
+      const seed =
+        taxonomy && taxonomy.categories.length > 0
+          ? taxonomy.categories.map(c => ({
+              id: c.id,
+              name: c.name,
+              icon: CATEGORY_ICONS[c.id] || CATEGORY_ICONS[c.name.trim().toLowerCase()] || 'pricetag-outline',
+              count: 0,
+            }))
+          : DEFAULT_CATEGORIES.filter(c => c.id !== 'all').map(c => ({ ...c, count: 0 }));
 
-        const merged = Array.from(mergedById.values());
-        const totalCount = merged.reduce((sum, c) => sum + c.count, 0);
-        setCategories([{ id: 'all', name: 'All', icon: 'star', count: totalCount }, ...merged]);
+      const mergedById = new Map(seed.map(c => [c.id.toLowerCase(), { ...c }]));
+
+      for (const c of cats || []) {
+        const id = c.id.toLowerCase();
+        const existing = mergedById.get(id);
+        mergedById.set(id, {
+          id,
+          name: existing?.name || c.name,
+          icon: existing?.icon || CATEGORY_ICONS[c.name.trim().toLowerCase()] || 'pricetag-outline',
+          count: c.count,
+        });
       }
+
+      // Hide legacy zero-count defaults when a configured taxonomy is active.
+      let merged = Array.from(mergedById.values());
+      if (taxonomy && taxonomy.categories.length > 0) {
+        const configured = new Set(taxonomy.categories.map(c => c.id.toLowerCase()));
+        merged = merged.filter(c => configured.has(c.id.toLowerCase()) || c.count > 0);
+      }
+
+      const totalCount = merged.reduce((sum, c) => sum + c.count, 0);
+      setCategories([{ id: 'all', name: 'All', icon: 'star', count: totalCount }, ...merged]);
     } catch (e) {
       console.warn('Failed to load categories, using defaults:', e);
     }
@@ -421,7 +435,9 @@ const HomeScreen = () => {
       (post.summary && post.summary.toLowerCase().includes(searchQuery.toLowerCase())) ||
       (post.tags && post.tags.some(tag => tag.toLowerCase().includes(searchQuery.toLowerCase())));
 
-    const matchesCategory = selectedCategory === 'all' || post.category === selectedCategory;
+    const matchesCategory =
+      selectedCategory === 'all' ||
+      (post.category || '').trim().toLowerCase() === selectedCategory.trim().toLowerCase();
 
     return matchesSearch && matchesCategory;
   });

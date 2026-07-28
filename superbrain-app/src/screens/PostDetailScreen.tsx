@@ -17,8 +17,11 @@ import { DEFAULT_CATEGORIES, CATEGORY_ICONS } from '../constants/categories';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'PostDetail'>;
 
-// Filter out 'all' from categories to use for the edit dropdown
-const CATEGORIES = DEFAULT_CATEGORIES.filter(c => c.id !== 'all');
+type CategoryOption = { id: string; name: string; icon: string };
+
+const FALLBACK_CATEGORIES: CategoryOption[] = DEFAULT_CATEGORIES
+  .filter(c => c.id !== 'all')
+  .map(c => ({ id: c.id, name: c.name, icon: c.icon }));
 
 const PostDetailScreen = ({ route, navigation }: Props) => {
   const { post } = route.params;
@@ -28,6 +31,7 @@ const PostDetailScreen = ({ route, navigation }: Props) => {
   const [editedTitle, setEditedTitle] = useState(post.title);
   const [editedSummary, setEditedSummary] = useState(post.summary);
   const [saving, setSaving] = useState(false);
+  const [categoryOptions, setCategoryOptions] = useState<CategoryOption[]>(FALLBACK_CATEGORIES);
   const [deleting, setDeleting] = useState(false);
   const [reanalyzing, setReanalyzing] = useState(false);
   const [toast, setToast] = useState({ visible: false, message: '', type: 'info' as 'success' | 'error' | 'warning' | 'info' });
@@ -45,6 +49,42 @@ const PostDetailScreen = ({ route, navigation }: Props) => {
       });
     }
   }, [showEditModal]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const taxonomy = await apiService.getTaxonomy();
+        if (cancelled) return;
+        if (taxonomy && taxonomy.categories.length > 0) {
+          setCategoryOptions(
+            taxonomy.categories.map(c => ({
+              id: c.id,
+              name: c.name,
+              icon: CATEGORY_ICONS[c.id] || CATEGORY_ICONS[c.name.trim().toLowerCase()] || 'pricetag',
+            }))
+          );
+          return;
+        }
+        const cats = await apiService.getCategories();
+        if (cancelled) return;
+        if (cats && cats.length > 0) {
+          setCategoryOptions(
+            cats.map(c => ({
+              id: c.id,
+              name: c.name,
+              icon: CATEGORY_ICONS[c.id] || CATEGORY_ICONS[c.name.trim().toLowerCase()] || 'pricetag',
+            }))
+          );
+        }
+      } catch {
+        // Keep FALLBACK_CATEGORIES
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const getPostImageUrl = (post: Post) => {
     if (post.thumbnail_url) return post.thumbnail_url;
@@ -390,8 +430,10 @@ const PostDetailScreen = ({ route, navigation }: Props) => {
                 contentContainerStyle={styles.categoriesContent}
                 keyboardShouldPersistTaps="always"
               >
-                {CATEGORIES.map((cat) => {
-                  const isActive = editedCategory === cat.id;
+                {categoryOptions.map((cat) => {
+                  const isActive =
+                    (editedCategory || '').trim().toLowerCase() === cat.id.toLowerCase() ||
+                    (editedCategory || '').trim().toLowerCase() === cat.name.trim().toLowerCase();
                   const catColor = getCategoryColor(cat.id);
                   return (
                     <TouchableOpacity
@@ -406,7 +448,7 @@ const PostDetailScreen = ({ route, navigation }: Props) => {
                           backgroundColor: catColor + '10',
                         },
                       ]}
-                      onPress={() => setEditedCategory(cat.id)}
+                      onPress={() => setEditedCategory(cat.name)}
                     >
                       <Ionicons
                         name={cat.icon as any}

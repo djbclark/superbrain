@@ -41,6 +41,40 @@ def _open_db(path: Path) -> Database:
     return Database(path)
 
 
+def cmd_validate(args: argparse.Namespace) -> int:
+    """Load taxonomy config only — no model calls, no DB writes."""
+    clear_taxonomy_cache()
+    try:
+        taxonomy = get_taxonomy(Path(args.config) if args.config else None)
+    except TaxonomyError as exc:
+        print(f"Invalid taxonomy: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "mode": "validate",
+                "config": str(taxonomy.config_path) if taxonomy.config_path else None,
+                "loaded_from_file": taxonomy.loaded_from_file,
+                "use_default_categories": taxonomy.use_default_categories,
+                "allow_multiple_categories": taxonomy.allow_multiple_categories,
+                "fallback_category": taxonomy.fallback_category,
+                "confidence_threshold": taxonomy.confidence_threshold,
+                "taxonomy_version": taxonomy.version,
+                "categories": [
+                    {
+                        "name": c.name,
+                        "precedence": c.precedence,
+                        "source": c.source,
+                    }
+                    for c in taxonomy.categories
+                ],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def cmd_backup(args: argparse.Namespace) -> int:
     src = Path(args.database)
     if not src.is_file():
@@ -340,6 +374,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to categories.toml (default: backend/config/categories.toml)",
     )
     sub = p.add_subparsers(dest="command", required=True)
+
+    v = sub.add_parser("validate", help="Validate taxonomy config only (no AI, no DB writes)")
+    v.set_defaults(func=cmd_validate)
 
     b = sub.add_parser("backup", help="Create and validate a SQLite backup")
     b.add_argument("--output", default=None, help="Backup destination path")

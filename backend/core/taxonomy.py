@@ -10,6 +10,7 @@ must not be overwritten by deploy-local.sh.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -20,7 +21,12 @@ except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib  # type: ignore
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
-DEFAULT_CONFIG_PATH = CONFIG_DIR / "categories.toml"
+DEFAULT_CONFIG_PATH = Path(
+    os.environ.get(
+        "SUPERBRAIN_CATEGORIES_CONFIG",
+        str(CONFIG_DIR / "categories.toml"),
+    )
+)
 EXAMPLE_CONFIG_PATH = CONFIG_DIR / "categories.toml.example"
 
 # Built-in defaults used only when use_default_categories is true, or when no

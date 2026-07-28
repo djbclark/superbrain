@@ -51,7 +51,7 @@ def is_valid_api_token_format(token: str) -> bool:
     """Validate token format: exactly 8 alphanumeric chars."""
     return len(token) == 8 and token.isalnum()
 
-TOKEN_FILE = Path(__file__).parent / "token.txt"
+TOKEN_FILE = Path(os.getenv("TOKEN_FILE", str(Path(__file__).parent / "token.txt")))
 
 def load_or_create_api_token():
     """Load existing API token or create one if missing."""
@@ -934,6 +934,40 @@ async def get_all_categories(token: str = Depends(verify_token)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/taxonomy")
+async def get_taxonomy_config(token: str = Depends(verify_token)):
+    """
+    Return the effective configured category taxonomy.
+
+    Used by mobile clients to render filter/edit options even when some
+    categories currently have zero assigned posts.
+    """
+    try:
+        from core.taxonomy import get_taxonomy
+
+        tax = get_taxonomy()
+        return {
+            "success": True,
+            "use_default_categories": tax.use_default_categories,
+            "allow_multiple_categories": tax.allow_multiple_categories,
+            "fallback_category": tax.fallback_category,
+            "confidence_threshold": tax.confidence_threshold,
+            "taxonomy_version": tax.version,
+            "categories": [
+                {
+                    "id": c.name.lower(),
+                    "name": c.name,
+                    "precedence": c.precedence,
+                    "guidance": c.guidance,
+                    "source": c.source,
+                }
+                for c in sorted(tax.categories, key=lambda x: x.precedence)
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/category/{category}")
 async def get_by_category(
     category: str,
@@ -951,6 +985,15 @@ async def get_by_category(
     try:
         db = get_db()
         results = db.get_by_category(category, limit=limit)
+        # Case-insensitive fallback when the path uses a lowercase id.
+        if not results and category != category.lower():
+            results = db.get_by_category(category.lower(), limit=limit)
+        if not results:
+            # Match configured display name when client sends lowercase id.
+            from core.taxonomy import get_taxonomy
+            resolved = get_taxonomy().resolve_name(category)
+            if resolved and resolved != category:
+                results = db.get_by_category(resolved, limit=limit)
 
         return {
             "success": True,
