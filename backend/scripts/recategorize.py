@@ -30,6 +30,11 @@ sys.path.insert(0, str(BACKEND_ROOT))
 
 from core.classifier import aggregate_suggestions, classify_content
 from core.database import Database, DB_PATH
+from core.reference_db import (
+    copy_reference_row_to_primary,
+    open_reference_database,
+    resolve_analysis_row,
+)
 from core.taxonomy import TaxonomyError, clear_taxonomy_cache, get_taxonomy
 
 
@@ -118,6 +123,306 @@ def _excerpt_for_row(row: dict) -> str:
         row.get("visual_analysis") or "",
     ]
     return "\n".join(p for p in parts if p)[:4000]
+
+
+def _fetch_missing_metadata(url: str, cookies: str | None, timeout_s: float) -> dict | None:
+    """Best-effort yt-dlp metadata fetch capped by timeout_s (no full analysis)."""
+    import subprocess
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    from analyzers.youtube_analyzer import _cookie_args
+
+    def _run():
+        cmd = [
+            "yt-dlp",
+            "--dump-json",
+            "--no-download",
+            "--no-warnings",
+            "--socket-timeout",
+            str(max(1, int(timeout_s))),
+        ]
+        cmd.extend(_cookie_args(cookies))
+        cmd.append(url)
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, timeout_s),
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        import json
+
+        data = json.loads(proc.stdout.splitlines()[0])
+        return {
+            "title": data.get("title") or "",
+            "summary": (data.get("description") or "")[:2000],
+            "tags": data.get("tags") or [],
+            "username": data.get("uploader") or data.get("channel") or "",
+            "thumbnail": data.get("thumbnail") or "",
+            "post_date": (
+                f"{str(data.get('upload_date'))[:4]}-"
+                f"{str(data.get('upload_date'))[4:6]}-"
+                f"{str(data.get('upload_date'))[6:8]}"
+                if data.get("upload_date") and len(str(data.get("upload_date"))) == 8
+                else None
+            ),
+        }
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(_run)
+        try:
+            return fut.result(timeout=timeout_s)
+        except FuturesTimeout:
+            fut.cancel()
+            return None
+        except Exception:
+            return None
+
+
+def cmd_playlists(args: argparse.Namespace) -> int:
+    """
+    Recategorize videos from one or more playlists.
+
+    Uses --reference-database (or SUPERBRAIN_REFERENCE_DATABASE_PATH) to reuse
+    transcripts/metadata. Items missing from both DBs get a capped metadata
+    fetch (default 20s) before classification. Writes categories when
+    --i-understand-this-writes-categories is set.
+    """
+    if not args.i_understand:
+        print(
+            "Refusing playlist recategorize without "
+            "--i-understand-this-writes-categories",
+            file=sys.stderr,
+        )
+        return 2
+
+    clear_taxonomy_cache()
+    try:
+        taxonomy = get_taxonomy(Path(args.config) if args.config else None)
+    except TaxonomyError as exc:
+        print(f"Invalid taxonomy: {exc}", file=sys.stderr)
+        return 1
+
+    from analyzers.playlist_analyzer import extract_playlist_urls
+    from core.link_checker import validate_link
+
+    primary = _open_db(Path(args.database))
+    reference = open_reference_database(args.reference_database)
+    if reference:
+        print(f"Reference DB (read-only): {reference.db_path}")
+    else:
+        print("No reference DB configured; using primary only")
+
+    out_path = Path(args.out) if args.out else Path(
+        f"/tmp/superbrain-playlist-recat-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    done: set[str] = set()
+    if args.resume and out_path.is_file():
+        with out_path.open(encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sc = rec.get("shortcode")
+                if sc:
+                    done.add(sc)
+        print(f"Resume: skipping {len(done)} already-processed shortcodes")
+
+    # Optional cached URL list to avoid re-extracting playlists on resume.
+    url_cache = Path(args.url_cache) if args.url_cache else out_path.with_suffix(".urls.txt")
+    if args.resume and url_cache.is_file():
+        video_urls = [
+            line.strip() for line in url_cache.read_text().splitlines() if line.strip()
+        ]
+        print(f"Loaded {len(video_urls)} cached playlist URLs from {url_cache}")
+    else:
+        video_urls = []
+        for playlist in args.playlist:
+            print(f"Extracting playlist: {playlist}")
+            urls = extract_playlist_urls(playlist, cookies=args.cookies)
+            print(f"  → {len(urls)} videos")
+            video_urls.extend(urls)
+        video_urls = list(dict.fromkeys(video_urls))
+        url_cache.write_text("\n".join(video_urls) + "\n")
+        print(f"Cached playlist URLs → {url_cache}")
+
+    print(f"Unique videos across playlists: {len(video_urls)}")
+
+    stats = {
+        "total": len(video_urls),
+        "skipped_resume": 0,
+        "from_primary": 0,
+        "from_reference": 0,
+        "missing_fetched": 0,
+        "missing_failed": 0,
+        "classified": 0,
+        "written": 0,
+        "write_failed": 0,
+        "fallback": 0,
+    }
+    stats_lock = __import__("threading").Lock()
+
+    def process_one(url: str) -> dict:
+        validation = validate_link(url)
+        if not validation.get("valid"):
+            with stats_lock:
+                stats["missing_failed"] += 1
+            return {
+                "url": url,
+                "error": "invalid_url",
+                "detail": validation.get("error"),
+            }
+
+        shortcode = validation["shortcode"]
+        if shortcode in done:
+            with stats_lock:
+                stats["skipped_resume"] += 1
+            return {"shortcode": shortcode, "skipped": True}
+
+        # Per-call DB handle is fine; Database uses thread-local connections.
+        row, source = resolve_analysis_row(
+            shortcode, primary=primary, reference=reference
+        )
+
+        if source == "primary":
+            with stats_lock:
+                stats["from_primary"] += 1
+        elif source == "reference":
+            with stats_lock:
+                stats["from_reference"] += 1
+            copy_reference_row_to_primary(row, primary, preserve_category=True)
+        else:
+            meta = _fetch_missing_metadata(
+                url, args.cookies, float(args.missing_ai_timeout)
+            )
+            if not meta:
+                with stats_lock:
+                    stats["missing_failed"] += 1
+                return {
+                    "shortcode": shortcode,
+                    "url": url,
+                    "error": "missing_and_fetch_timeout_or_failed",
+                    "timeout_s": args.missing_ai_timeout,
+                }
+            with stats_lock:
+                stats["missing_fetched"] += 1
+            primary.save_analysis(
+                shortcode=shortcode,
+                url=url,
+                username=meta.get("username") or "",
+                title=meta.get("title") or "",
+                summary=meta.get("summary") or "",
+                tags=meta.get("tags") or [],
+                music="",
+                category=taxonomy.fallback_category,
+                content_type="youtube",
+                thumbnail=meta.get("thumbnail") or "",
+                post_date=meta.get("post_date"),
+                category_source="fallback",
+                category_rationale="seeded from capped metadata fetch",
+                category_taxonomy_version=taxonomy.version,
+            )
+            row = primary.get_by_shortcode(shortcode)
+            source = "fetched"
+
+        result = classify_content(
+            title=row.get("title") or "",
+            summary=row.get("summary") or "",
+            tags=row.get("tags") or [],
+            extra_text=_excerpt_for_row(row),
+            taxonomy=taxonomy,
+            source="migration",
+        )
+        with stats_lock:
+            stats["classified"] += 1
+            if result.source == "fallback":
+                stats["fallback"] += 1
+
+        ok = primary.update_category_metadata(
+            shortcode,
+            category=result.category,
+            category_source=result.source,
+            category_confidence=result.confidence,
+            category_rationale=result.rationale or "",
+            category_suggestions_json=result.suggestions or [],
+            category_taxonomy_version=taxonomy.version,
+        )
+        with stats_lock:
+            if ok:
+                stats["written"] += 1
+            else:
+                stats["write_failed"] += 1
+
+        return {
+            "shortcode": shortcode,
+            "url": url,
+            "row_source": source,
+            "old_category": row.get("category"),
+            "new_category": result.category,
+            "confidence": result.confidence,
+            "source": result.source,
+            "fallback_reason": result.fallback_reason,
+            "suggestions": result.suggestions,
+            "written": ok,
+        }
+
+    pending_urls = []
+    for url in video_urls:
+        validation = validate_link(url)
+        sc = validation.get("shortcode") if validation.get("valid") else None
+        if sc and sc in done:
+            stats["skipped_resume"] += 1
+            continue
+        pending_urls.append(url)
+
+    print(f"Pending after resume filter: {len(pending_urls)}")
+    workers = max(1, int(args.workers))
+    mode = "a" if (args.resume and out_path.is_file()) else "w"
+    processed = 0
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with out_path.open(mode, encoding="utf-8") as fh, ThreadPoolExecutor(
+        max_workers=workers
+    ) as pool:
+        futures = {pool.submit(process_one, url): url for url in pending_urls}
+        for fut in as_completed(futures):
+            rec = fut.result()
+            if rec.get("skipped"):
+                continue
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fh.flush()
+            if rec.get("shortcode"):
+                done.add(rec["shortcode"])
+            processed += 1
+            if args.progress and processed % 10 == 0:
+                print(f"progress {processed}/{len(pending_urls)} {stats}", flush=True)
+
+    if reference:
+        reference.close()
+
+    summary = {
+        "mode": "playlists-apply",
+        "generated_at": _utcnow(),
+        "database": str(Path(args.database)),
+        "reference_database": (
+            str(getattr(reference, "db_path", None)) if reference else None
+        ),
+        "taxonomy_version": taxonomy.version,
+        "playlists": list(args.playlist),
+        "report": str(out_path),
+        "stats": stats,
+    }
+    summary_path = out_path.with_suffix(out_path.suffix + ".summary.json")
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+    print(json.dumps(summary, indent=2))
+    return 0 if stats["write_failed"] == 0 else 1
 
 
 def cmd_dry_run(args: argparse.Namespace) -> int:
@@ -414,6 +719,47 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
     )
     r.set_defaults(func=cmd_rollback)
+
+    pl = sub.add_parser(
+        "playlists",
+        help=(
+            "Recategorize playlist videos using optional reference DB for "
+            "transcripts; capped fetch for missing items; writes categories"
+        ),
+    )
+    pl.add_argument(
+        "--playlist",
+        action="append",
+        required=True,
+        help="Playlist URL (repeatable). Use list=WL for Watch Later.",
+    )
+    pl.add_argument("--cookies", default=None, help="yt-dlp cookies (e.g. chrome)")
+    pl.add_argument(
+        "--reference-database",
+        default=None,
+        help="Read-only SuperBrain DB for transcript/metadata reuse",
+    )
+    pl.add_argument(
+        "--missing-ai-timeout",
+        type=float,
+        default=20.0,
+        help="Seconds capped for metadata fetch when not in primary/reference DB",
+    )
+    pl.add_argument("--out", default=None, help="JSONL report path")
+    pl.add_argument("--url-cache", default=None, help="Optional cached playlist URL list")
+    pl.add_argument("--workers", type=int, default=2, help="Parallel classify workers")
+    pl.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip shortcodes already present in --out and reuse URL cache when present",
+    )
+    pl.add_argument("--progress", action="store_true")
+    pl.add_argument(
+        "--i-understand-this-writes-categories",
+        dest="i_understand",
+        action="store_true",
+    )
+    pl.set_defaults(func=cmd_playlists)
     return p
 
 

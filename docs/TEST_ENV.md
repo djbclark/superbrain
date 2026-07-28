@@ -26,18 +26,21 @@ backend/scripts/test-env.sh promote-plan
 backend/scripts/test-env.sh teardown
 ```
 
-## Why no full AI dry-run here
+## Reference database (token-saving)
 
-`recategorize.py dry-run` classifies every row with the model router and would
-spend tokens across the live corpus. The test env instead:
+The test environment can read transcripts/titles/summaries from another
+SuperBrain SQLite file (usually production) via:
 
-1. Installs the example taxonomy
-2. Validates config
-3. Seeds a handful of fixture posts already labeled with the new categories
-4. Smoke-tests `/taxonomy` and `/categories` for Android UI wiring
+```bash
+export SUPERBRAIN_REFERENCE_DATABASE_PATH="$HOME/.superbrain-server/superbrain.db"
+```
 
-Full corpus dry-run/apply belongs in the **promote** step against a backed-up
-live DB, after approval.
+`scripts/recategorize.py playlists` uses that reference DB before spending any
+capped metadata-fetch budget (`--missing-ai-timeout`, default 20s) on videos
+that are not present locally.
+
+Local omlx on port 8000 is configured through `OMLX_HOST` /
+`SUPERBRAIN_API_KEYS_FILE` (see `~/.superbrain-server-test/config/`).
 
 ## Android UI
 

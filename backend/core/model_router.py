@@ -46,7 +46,9 @@ def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 CONFIG_DIR    = Path(__file__).resolve().parent.parent / "config"
-API_KEYS_FILE = CONFIG_DIR / ".api_keys"
+API_KEYS_FILE = Path(
+    os.getenv("SUPERBRAIN_API_KEYS_FILE", str(CONFIG_DIR / ".api_keys"))
+)
 STATE_DIR = Path(
     os.getenv(
         "SUPERBRAIN_STATE_DIR",

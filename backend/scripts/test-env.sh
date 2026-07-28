@@ -109,6 +109,25 @@ export HOST=127.0.0.1
 export ENVIRONMENT=development
 export DISABLE_API_DOCS=0
 EOF
+  # Wire production as read-only reference for transcripts/metadata reuse.
+  LIVE_DB="${LIVE_DIR}/superbrain.db"
+  if [[ -f "$LIVE_DB" ]]; then
+    echo "export SUPERBRAIN_REFERENCE_DATABASE_PATH=\"$LIVE_DB\"" >> "$TEST_DIR/env.sh"
+  fi
+  # Prefer local omlx on :8000 (matches production). Do not copy secret files into git.
+  echo 'export OMLX_HOST="${OMLX_HOST:-http://localhost:8000}"' >> "$TEST_DIR/env.sh"
+  if [[ -f "$LIVE_DIR/config/.api_keys" ]]; then
+    # Import key material into the test process environment via a root-owned copy
+    # outside the git checkout. Values are never printed.
+    cp "$LIVE_DIR/config/.api_keys" "$TEST_DIR/config/.api_keys"
+    chmod 600 "$TEST_DIR/config/.api_keys"
+    if ! grep -q '^OMLX_HOST=' "$TEST_DIR/config/.api_keys"; then
+      printf '\nOMLX_HOST=http://localhost:8000\n' >> "$TEST_DIR/config/.api_keys"
+    fi
+    # Point model_router at the test config dir by symlinking into a sidecar
+    # path used only when SUPERBRAIN_API_KEYS_FILE is set (see model_router).
+    echo "export SUPERBRAIN_API_KEYS_FILE=\"$TEST_DIR/config/.api_keys\"" >> "$TEST_DIR/env.sh"
+  fi
   echo "Test environment ready at $TEST_DIR (port $TEST_PORT)"
   echo "Live runtime left untouched: $LIVE_DIR"
 }
