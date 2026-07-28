@@ -57,8 +57,28 @@ class TestModelRouterResilience(unittest.TestCase):
             if index == 0 or providers[index - 1] != provider
         ]
         self.assertEqual(
-            compressed, ["groq", "gemini", "openrouter", "ollama", "omlx"]
+            compressed, ["groq", "gemini", "openrouter", "omlx", "ollama"]
         )
+
+    def test_provider_order_env_override(self):
+        router = make_router()
+        with patch.dict(
+            os.environ,
+            {"SUPERBRAIN_PROVIDER_ORDER": "openrouter,omlx,ollama,groq,gemini"},
+        ):
+            ranked = router._ranked_models("text")
+            providers = [
+                model_router.MODELS_BY_KEY[key]["provider"] for key in ranked
+            ]
+            compressed = [
+                provider
+                for index, provider in enumerate(providers)
+                if index == 0 or providers[index - 1] != provider
+            ]
+            self.assertEqual(
+                compressed, ["openrouter", "omlx", "ollama", "groq", "gemini"]
+            )
+            self.assertEqual(ranked[0], "openrouter_llama31_8b_floor")
 
     def test_environment_overrides_ignored_api_keys_file(self):
         router = model_router.ModelRouter.__new__(model_router.ModelRouter)

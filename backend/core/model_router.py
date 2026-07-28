@@ -269,6 +269,14 @@ MODELS: List[Dict[str, Any]] = [
         "desc": "Gemini 1.5 Flash (deprecated — fallback only)",
     },
     {
+        "key": "openrouter_llama31_8b_floor",
+        "provider": "openrouter",
+        "model_id": "meta-llama/llama-3.1-8b-instruct:floor",
+        "type": "text",
+        "base_priority": 0,
+        "desc": "OpenRouter Llama-3.1 8B Instruct (:floor = cheapest paid provider)",
+    },
+    {
         "key": "openrouter_llama33_70b",
         "provider": "openrouter",
         "model_id": "meta-llama/llama-3.3-70b-instruct:free",
@@ -565,6 +573,24 @@ PROVIDER_ORDER = {
     "omlx": 3,
     "ollama": 4,
 }
+
+
+def _active_provider_order() -> Dict[str, int]:
+    """
+    Return provider sort tiers (lower = preferred).
+
+    Override with comma-separated SUPERBRAIN_PROVIDER_ORDER, e.g.
+    openrouter,groq,gemini,omlx,ollama — useful to force paid OpenRouter
+    for bulk jobs when free Groq/Gemini tiers are exhausted.
+    """
+    raw = (os.getenv("SUPERBRAIN_PROVIDER_ORDER") or "").strip()
+    if not raw:
+        return PROVIDER_ORDER
+    names = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    order = {name: i for i, name in enumerate(names)}
+    for name, idx in PROVIDER_ORDER.items():
+        order.setdefault(name, 100 + idx)
+    return order
 
 logger = logging.getLogger(__name__)
 
@@ -1005,10 +1031,11 @@ class ModelRouter:
                 ]
         all_candidates = static_candidates + dynamic_candidates
 
+        provider_order = _active_provider_order()
         return sorted(
             all_candidates,
             key=lambda key: (
-                PROVIDER_ORDER.get(
+                provider_order.get(
                     (MODELS_BY_KEY.get(key) or self._dynamic_models.get(key))[
                         "provider"
                     ],
