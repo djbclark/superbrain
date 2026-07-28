@@ -1,0 +1,48 @@
+# Example SuperBrain category taxonomy.
+# Copy to categories.toml and edit for your deployment.
+# The real categories.toml is gitignored and must never be committed.
+#
+# deploy-local.sh does not copy config/*.toml into the runtime, so the live
+# file under ~/.superbrain-server/config/categories.toml is safe from deploys.
+
+[taxonomy]
+use_default_categories = false
+allow_multiple_categories = false
+fallback_category = "Other"
+confidence_threshold = 0.55
+suggestion_min_count = 5
+
+[[categories]]
+name = "Sysadmin"
+precedence = 1
+guidance = "Actionable development, software, systems, tooling, and workflows the operator could use functionally."
+
+[[categories]]
+name = "Science"
+precedence = 2
+guidance = "Scientific concepts, research, methods, experiments, and discoveries."
+
+[[categories]]
+name = "Technology"
+precedence = 3
+guidance = "Technology news or discussion that is interesting but not operationally actionable for the operator."
+
+[[categories]]
+name = "History"
+precedence = 4
+guidance = "Historical events, periods, figures, and analysis of the past."
+
+[[categories]]
+name = "Humanities"
+precedence = 5
+guidance = "Philosophy, arts, literature, culture, language, and related humanistic topics."
+
+[[categories]]
+name = "Politics"
+precedence = 6
+guidance = "Political news, policy, government, elections, and civic affairs."
+
+[[categories]]
+name = "Other"
+precedence = 7
+guidance = "Content that does not fit the categories above. Prefer a specific category when evidence supports one."

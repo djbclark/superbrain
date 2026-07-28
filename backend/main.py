@@ -18,6 +18,8 @@ import time
 # Import local modules
 from core.link_checker import validate_link
 from core.database import get_db
+from core.taxonomy import get_taxonomy
+from core.classifier import classify_content
 from analyzers.youtube_analyzer import analyze_youtube
 from analyzers.webpage_analyzer import analyze_webpage
 
@@ -115,6 +117,7 @@ INSTAGRAM POST: {instagram_url}
 """
 
     # Generate structured summary using LLM
+    taxonomy = get_taxonomy()
     prompt = f"""Based on the following analysis of an Instagram post, create a comprehensive structured summary.
 
 {combined_info}
@@ -138,7 +141,7 @@ Generate a report in this EXACT format:
 [Music/song name if found, or "No background music" or "Voiceover only"]
 
 📂 CATEGORY:
-[Choose ONE from: product, places, food, software, book, tv shows, fitness, film, event]
+[{taxonomy.category_choice_line()}]
 
 Be specific, concise, and actionable. Focus on useful information."""
 
@@ -217,6 +220,7 @@ def parse_summary(summary_text):
     tags = []
     music = ""
     category = ""
+    taxonomy = get_taxonomy()
 
     try:
         title   = _parse_field(summary_text, "📌", "TITLE")
@@ -240,59 +244,45 @@ def parse_summary(summary_text):
             if _mm:
                 music = _mm.group(1).strip()
 
-        # Category: grab first word/phrase that matches a known category
-        raw_cat = _parse_field(summary_text, "📂", "CATEGORY").lower()
-        # Strip markdown bold leftovers and pick first line
+        raw_cat = _parse_field(summary_text, "📂", "CATEGORY")
         raw_cat = re.sub(r'\*+', '', raw_cat).strip()
         raw_cat = raw_cat.split('\n')[0].strip()
-        category = raw_cat
+        # Keep free-form parse only if it matches the configured taxonomy.
+        category = taxonomy.resolve_name(raw_cat) or ""
 
     except Exception as e:
         print(f"⚠️ Error parsing summary: {e}")
 
-    # Fallback: Auto-detect category if empty or unrecognised
-    valid_categories = {'product', 'places', 'software', 'book',
-                        'tv shows', 'fitness', 'film', 'event', 'food', 'other'}
-    if not category or category not in valid_categories:
-        category = auto_detect_category(summary_text, title, summary, tags)
+    # Do not keyword-guess. Authoritative assignment happens in assign_category().
+    if not category:
+        category = taxonomy.fallback_category
 
     return title, summary, tags, music, category
 
-def auto_detect_category(summary_text, title, summary, tags):
+
+def assign_category(title, summary, tags, extra_text="", *, source="model"):
     """
-    Auto-detect category based on content keywords
-
-    Returns:
-        str: Detected category
+    Authoritative classification against the configured taxonomy.
+    Returns (category, metadata_kwargs_for_save_analysis).
     """
-    combined = f"{title} {summary} {' '.join(tags)} {summary_text}".lower()
-
-    # Category keywords
-    category_keywords = {
-        'product': ['camera', 'device', 'gadget', 'tech', 'phone', 'laptop', 'review', 'unbox', 'product', 'dji', 'osmo', 'action cam'],
-        'places': ['travel', 'trip', 'visit', 'destination', 'village', 'city', 'mountain', 'beach', 'hotel', 'itinerary', 'sikkim', 'location'],
-        'food': ['food', 'meal', 'cuisine', 'restaurant', 'cafe', 'dining', 'eat', 'recipe', 'cooking', 'dish', 'ingredients', 'cook', 'bake'],
-        'software': ['app', 'software', 'code', 'programming', 'developer', 'api', 'python', 'javascript'],
-        'book': ['book', 'novel', 'author', 'read', 'literature', 'story', 'chapter'],
-        'fitness': ['workout', 'fitness', 'exercise', 'gym', 'training', 'muscle', 'cardio', 'yoga'],
-        'film': ['movie', 'film', 'cinema', 'actor', 'actress', 'director', 'trailer', 'premiere'],
-        'tv shows': ['series', 'episode', 'season', 'show', 'tv show', 'streaming', 'netflix'],
-        'event': ['event', 'concert', 'festival', 'conference', 'meetup', 'workshop', 'seminar']
-    }
-
-    # Count keyword matches
-    scores = {}
-    for category, keywords in category_keywords.items():
-        score = sum(1 for keyword in keywords if keyword in combined)
-        scores[category] = score
-
-    # Get category with highest score
-    best_category = max(scores, key=scores.get)
-
-    if scores[best_category] > 0:
-        return best_category
-
-    return "other"
+    taxonomy = get_taxonomy()
+    result = classify_content(
+        title=title or "",
+        summary=summary or "",
+        tags=tags or [],
+        extra_text=extra_text or "",
+        taxonomy=taxonomy,
+        source=source,
+    )
+    print(
+        f"📂 Assigned category: {result.category} "
+        f"(source={result.source}, confidence={result.confidence}, "
+        f"fallback={result.fallback_reason})"
+    )
+    meta = result.as_db_fields(taxonomy.version)
+    # save_analysis expects category separately plus optional meta fields
+    category = meta.pop("category")
+    return category, meta
 
 def run_script(script_name, args):
     """Run a Python script and return success status"""
@@ -514,6 +504,19 @@ def run_youtube_analysis(
     # Use upload date scraped directly from YouTube page (always accurate)
     yt_post_date = result.get('post_date')
 
+    category, category_meta = assign_category(
+        title,
+        summary_text,
+        tags,
+        extra_text="\n".join(
+            [
+                result.get("transcript_text", "") or "",
+                raw[:3000],
+            ]
+        ),
+        source="model",
+    )
+
     print_section("💾 Saving to Database")
     saved = db.save_analysis(
         shortcode=shortcode,
@@ -531,6 +534,7 @@ def run_youtube_analysis(
         content_type='youtube',
         thumbnail=result.get('thumbnail', ''),
         post_date=yt_post_date,
+        **category_meta,
     )
     if not saved:
         print(f"❌ YouTube analysis completed but could not be persisted ({shortcode})")
@@ -571,6 +575,14 @@ def run_webpage_analysis(url: str, shortcode: str, db):
     if not title and page_title:
         title = page_title
 
+    category, category_meta = assign_category(
+        title,
+        summary_text,
+        tags,
+        extra_text=raw[:3000],
+        source="model",
+    )
+
     print_section("💾 Saving to Database")
     db.save_analysis(
         shortcode=shortcode,
@@ -587,6 +599,7 @@ def run_webpage_analysis(url: str, shortcode: str, db):
         content_type='webpage',
         thumbnail=result.get('thumbnail', ''),
         post_date=result.get('post_date'),
+        **category_meta,
     )
     print(f"✓ Web page analysis saved ({shortcode})")
     print_header("✅ Done — Web Page Analysis Complete")
@@ -958,6 +971,13 @@ def main():
     audio_text = "\n\n".join([_clean_audio(r['output']) for r in results['audio_transcription']])
     text_text = "\n\n".join([_clean_text(r['output']) for r in results['text']])
 
+    category, category_meta = assign_category(
+        title,
+        summary_text,
+        tags,
+        extra_text="\n".join([visual_text[:1500], audio_text[:1500], text_text[:1500], final_summary[:1500]]),
+        source="model",
+    )
     # — Instagram thumbnail: first downloaded jpg (converted to base64) —
     instagram_thumbnail = ""
     if jpg_files:
@@ -1002,6 +1022,7 @@ def main():
         likes=likes,
         post_date=post_date,
         thumbnail=instagram_thumbnail,
+        **category_meta,
     )
 
     print(f"✓ Analysis saved to database")

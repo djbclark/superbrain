@@ -13,7 +13,7 @@
 | **Frontend** | ~2,000 (TypeScript) |
 | **Core Modules** | ~1,500 |
 | **Languages** | Python 3.11, TypeScript 5.9, Java/Kotlin (Android build) |
-| **Database** | SQLite (local, zero-config) |
+| **Database** | SQLite (local, zero-config; runtime often `~/.superbrain-server/superbrain.db`) |
 | **API Framework** | FastAPI + Uvicorn |
 | **Mobile Framework** | React Native 0.81.5 + Expo |
 | **Containers** | Docker + Docker Compose |
@@ -58,22 +58,20 @@ superbrain/                          (Root)
 │   ├── main.py                      (300+ lines: analyzer orchestrator)
 │   ├── core/                        (Core services)
 │   │   ├── database.py              (SQLite manager)
-│   │   ├── model_router.py          (AI provider routing: 805 lines)
-│   │   ├── link_checker.py          (URL validation)
-│   │   └── category_manager.py
+│   │   ├── model_router.py          (AI provider routing)
+│   │   ├── taxonomy.py              (config-driven categories)
+│   │   ├── classifier.py            (structured classification)
+│   │   └── category_manager.py      (DEPRECATED MongoDB-era stub)
 │   ├── analyzers/                   (Content-type specific)
-│   │   ├── text_analyzer.py
-│   │   ├── visual_analyze.py
-│   │   ├── audio_transcribe.py
-│   │   ├── youtube_analyzer.py
-│   │   ├── webpage_analyzer.py
-│   │   ├── music_identifier.py
-│   │   └── caption.py
 │   ├── config/                      (Config files)
+│   │   ├── categories.toml.example  (taxonomy example; real file gitignored)
 │   │   ├── .api_keys                (gitignored)
 │   │   ├── model_rankings.json
 │   │   └── openrouter_free_models.json
-│   ├── tests/                       (Smoke tests)
+│   ├── scripts/
+│   │   ├── deploy-local.sh          (rsync allow-list → ~/.superbrain-server)
+│   │   └── recategorize.py          (metadata-only taxonomy migration)
+│   ├── tests/                       (Smoke + unit tests)
 │   └── requirements.txt
 │
 ├── superbrain-app/                  (React Native + Expo)
@@ -142,7 +140,7 @@ shortcode TEXT PRIMARY KEY     -- Instagram: code | YouTube: YT_id | Web: WP_has
 title TEXT                     -- AI-generated
 summary TEXT                   -- 3-5 sentences
 tags TEXT                      -- Space/JSON separated
-category TEXT                  -- Auto-assigned
+category TEXT                  -- Config-driven taxonomy assignment
 music TEXT                     -- Shazam identified
 content_type TEXT              -- 'instagram'/'youtube'/'webpage'
 visual_analysis TEXT           -- JSON from vision model

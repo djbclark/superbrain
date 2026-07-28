@@ -1,13 +1,19 @@
 # Database Codemap
 
-**Last Updated:** 2026-03-31
+**Last Updated:** 2026-07-28
 **Database:** SQLite (file-based, self-hosted)
 
 ## Database File
 
-- **Location:** `backend/superbrain.db`
+- **Source checkout default:** `backend/superbrain.db`
+- **Local runtime (this fork):** `~/.superbrain-server/superbrain.db`
+- **Override:** `DATABASE_PATH` env var
 - **Type:** SQLite with WAL mode for concurrent reads
-- **Features:** Foreign keys enabled, automatic migrations
+- **Features:** Foreign keys enabled, additive column migrations via
+  `_add_column_if_missing`
+
+> Older documentation that mentioned MongoDB is obsolete. The active code path
+> is SQLite only (`core/database.py`).
 
 ## Tables
 
@@ -30,11 +36,19 @@ CREATE TABLE analyses (
     summary             TEXT,
     tags                TEXT,          -- JSON array
     music               TEXT,
-    category            TEXT,
+    category            TEXT,          -- primary assigned category (API/mobile)
     visual_analysis     TEXT,
     audio_transcription TEXT,
     text_analysis       TEXT,
-    is_hidden           INTEGER DEFAULT 0  -- soft delete
+    is_hidden           INTEGER DEFAULT 0,  -- soft delete
+    transcript_mode     TEXT DEFAULT '',
+    -- Additive taxonomy metadata (optional; clients may ignore)
+    category_source     TEXT,
+    category_confidence REAL,
+    category_rationale  TEXT,
+    category_suggestions_json TEXT,
+    category_taxonomy_version TEXT,
+    categorized_at      TEXT
 );
 ```
 
@@ -45,219 +59,32 @@ CREATE TABLE analyses (
 
 ### 2. Processing Queue Table
 
-Manages pending and processing analyses.
-
-```sql
-CREATE TABLE processing_queue (
-    shortcode   TEXT PRIMARY KEY,
-    url         TEXT,
-    status      TEXT DEFAULT 'queued',  -- queued, processing, retry
-    position    INTEGER,
-    added_at    TEXT,
-    started_at  TEXT,
-    updated_at  TEXT,
-    retry_after TEXT,     -- for retry items
-    attempts    INTEGER DEFAULT 0,
-    reason      TEXT,     -- why retry is needed
-    content_type TEXT
-);
-```
-
-**Indexes:**
-- `idx_queue_status` - Status filtering
-- `idx_queue_position` - Queue ordering
-- `idx_queue_retry` - Retry scheduling
+Manages pending and processing analyses (`queued`, `processing`, `retry`).
 
 ### 3. Collections Table
 
-User-created collections for organizing saved posts.
+User-created collections for organizing saved posts (`post_ids` JSON array).
 
-```sql
-CREATE TABLE collections (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    icon        TEXT DEFAULT '📁',
-    post_ids    TEXT DEFAULT '[]',  -- JSON array of shortcodes
-    created_at  TEXT,
-    updated_at  TEXT
-);
-```
+### 4. WebSub + deleted_log
 
-**Default Collection:**
-- `default_watch_later` - Auto-created "Watch Later" collection
+YouTube channel subscription state and soft-delete sync tombstones.
 
-## Database Operations
-
-### Analyses
+## Category operations
 
 ```python
-# Save analysis
-db.save_analysis(
-    shortcode, url, username, title, summary,
-    tags, music, category, visual_analysis,
-    audio_transcription, text_analysis, content_type,
-    thumbnail, post_date, likes
-)
-
-# Check cache
-db.check_cache(shortcode) -> dict or None
-
-# Get recent
-db.get_recent(limit) -> List[dict]
-
-# Get by category
-db.get_by_category(category, limit) -> List[dict]
-
-# Search by tags
-db.search_tags(tags, limit) -> List[dict]
-
-# Get stats
-db.get_stats() -> {document_count, storage_mb, categories, capacity_used}
-
-# Delete (soft)
-db.delete_post(shortcode) -> bool
-
-# Hard delete (for force re-analyze)
-db.hard_delete_post(shortcode) -> bool
-
-# Restore soft-deleted
-db.restore_post(shortcode) -> bool
-
-# Update post
-db.update_post(shortcode, updates) -> bool
+db.save_analysis(..., category=..., category_source=..., category_confidence=...)
+db.update_category_metadata(shortcode, category=..., ...)
+db.update_post(shortcode, {"category": "Sysadmin"})  # marks source=manual
+db.get_by_category(category, limit)
+db.get_stats()["categories"]  # counts for visible posts only
+db.list_visible_for_recategorize()  # migration helper
 ```
 
-### Queue Operations
+Taxonomy migration must update category metadata only. Do not rebuild the
+database or redownload media for a taxonomy-only change. Use
+`scripts/recategorize.py`.
 
-```python
-# Add to queue
-db.add_to_queue(shortcode, url) -> position
+## Related
 
-# Get queue
-db.get_queue() -> List[dict]
-
-# Get processing
-db.get_processing() -> List[str]
-
-# Mark processing
-db.mark_processing(shortcode)
-
-# Remove from queue
-db.remove_from_queue(shortcode)
-
-# Get retry queue
-db.get_retry_queue() -> List[dict]
-
-# Queue for retry
-db.queue_for_retry(shortcode, url, content_type, reason, retry_hours)
-
-# Get retry-ready
-db.get_retry_ready() -> List[dict]
-
-# Recover interrupted
-db.recover_interrupted_items() -> count
-```
-
-### Collections
-
-```python
-# Get all collections
-db.get_collections() -> List[Collection]
-
-# Get single collection
-db.get_collection(collection_id) -> Collection or None
-
-# Upsert collection
-db.upsert_collection(id, name, icon, post_ids, created_at, updated_at) -> Collection
-
-# Update collection posts
-db.update_collection_posts(collection_id, post_ids) -> bool
-
-# Delete collection
-db.delete_collection(collection_id) -> bool
-```
-
-## Database Connection
-
-```python
-# From core/database.py
-from core.database import get_db
-
-db = get_db()
-
-# Check connection
-if db.is_connected():
-    # Perform operations
-```
-
-### Connection Parameters
-- Database: SQLite (file-based)
-- Location: `backend/superbrain.db`
-- Mode: WAL (Write-Ahead Logging) for better concurrency
-- Thread-safe: Yes (via `check_same_thread=False`)
-
-## Migrations
-
-The database supports automatic migrations for schema updates:
-
-1. **content_type column** - Added for content type support
-2. **thumbnail column** - Added for thumbnail storage
-3. **retry columns** - Added for retry queue support (`retry_after`, `attempts`, `reason`, `content_type`)
-4. **is_hidden column** - Added for soft-delete support
-
-## Data Flow
-
-```
-API Request
-    │
-    ▼
-┌─────────────────┐
-│  Check Cache   │ ◄─── Analyses Table
-└────────┬────────┘
-         │
-    ┌────┴────┐
-    │         │
-    │ Cache   │ No Analysis Needed
-    │ Found   │    │
-    ▼         ▼    ▼
-Return Data  ┌─────────────────┐
-              │  Not in Cache   │
-              └────────┬────────┘
-                       │
-                       ▼
-              ┌─────────────────┐
-              │   Add to Queue │
-              │ (processing_queue) │
-              └────────┬────────┘
-                       │
-                       ▼
-              ┌─────────────────┐
-              │ Background      │
-              │ Worker Thread   │
-              └────────┬────────┘
-                       │
-                       ▼
-              ┌─────────────────┐
-              │ Run Analysis    │
-              │ (main.py)       │
-              └────────┬────────┘
-                       │
-                       ▼
-              ┌─────────────────┐
-              │ Save to Cache   │
-              │ (analyses table)│
-              └─────────────────┘
-```
-
-## Storage Information
-
-- **File Location:** `backend/superbrain.db`
-- **Storage Format:** SQLite with WAL mode
-- **Capacity:** Limited by disk space (no cloud limits)
-- **Backup:** Export via `/export` endpoint to JSON or ZIP
-
-## Related Areas
-
-- [INDEX.md](INDEX.md) - Overall architecture
-- [FRONTEND.md](FRONTEND.md) - Frontend details
-- [BACKEND.md](BACKEND.md) - Backend details
+- [Backend Codemap](BACKEND.md)
+- [Category taxonomy proposal](../CATEGORY_TAXONOMY_PROPOSAL.md)

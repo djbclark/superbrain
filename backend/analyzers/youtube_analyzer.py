@@ -18,7 +18,7 @@ API_KEYS_FILE = Path(__file__).resolve().parent.parent / "config" / ".api_keys"
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
-YOUTUBE_PROMPT = """Watch this YouTube video carefully and write a structured analysis report.
+YOUTUBE_PROMPT_HEADER = """Watch this YouTube video carefully and write a structured analysis report.
 
 Generate the report in this EXACT format (use these exact emoji headers):
 
@@ -45,9 +45,27 @@ identifiable background music, write "No background music". If it's voiceover
 only, write "Voiceover only".]
 
 📂 CATEGORY:
-[Choose exactly ONE from: product, places, food, software, book, tv shows, fitness, film, event, other]
+"""
 
-Be specific, accurate, and extractive — pull out real names, numbers, and facts from the video."""
+
+def build_youtube_prompt() -> str:
+    from core.taxonomy import get_taxonomy
+
+    taxonomy = get_taxonomy()
+    return (
+        YOUTUBE_PROMPT_HEADER
+        + f"[{taxonomy.category_choice_line()}]\n\n"
+        "Be specific, accurate, and extractive — pull out real names, numbers, "
+        "and facts from the video."
+    )
+
+
+# Back-compat alias used by older imports/tests; rebuilt from live taxonomy.
+def _youtube_prompt() -> str:
+    return build_youtube_prompt()
+
+
+YOUTUBE_PROMPT = None  # resolved at call time via build_youtube_prompt()
 
 
 # ── Thumbnail helper ─────────────────────────────────────────────────────
@@ -433,7 +451,7 @@ def _analyze_youtube_via_groq(
     )
     if transcript_text:
         prompt += f"Transcript ({transcript_mode}): {transcript_text[:3000]}\n\n"
-    prompt += f"\n{YOUTUBE_PROMPT}"
+    prompt += f"\n{build_youtube_prompt()}"
 
     try:
         router = get_router()
@@ -520,7 +538,7 @@ def analyze_youtube(
                         file_uri=youtube_url,
                         mime_type="video/youtube",
                     ),
-                    YOUTUBE_PROMPT,
+                    build_youtube_prompt(),
                 ],
                 config=gtypes.GenerateContentConfig(
                     max_output_tokens=1500,

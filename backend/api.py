@@ -941,10 +941,11 @@ async def get_by_category(
     token: str = Depends(verify_token)
 ):
     """
-    Get analyses by category
+    Get analyses by category.
 
-    Categories: product, places, food, fashion, fitness, education,
-                entertainment, pets, other
+    Category names come from the configured user taxonomy
+    (`config/categories.toml`) and/or historically assigned values still
+    present in the database.
     - Requires API authentication
     """
     try:

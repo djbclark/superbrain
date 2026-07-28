@@ -13,6 +13,7 @@ build/
 .env
 *.env
 backend/config/.api_keys
+backend/config/categories.toml
 backend/.api_keys
 backend/.mongodb_config
 backend/.instagram_session.json

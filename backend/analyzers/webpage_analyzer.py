@@ -58,9 +58,21 @@ any products/places/tools mentioned, and the overall purpose of the page]
 [N/A — web page]
 
 📂 CATEGORY:
-[Choose exactly ONE from: product, places, food, software, book, tv shows, fitness, film, event, other]
+[{category_choice}]
 
 Be specific and factual. Extract real names, numbers, and details from the content."""
+
+
+def _build_web_prompt(url: str, page_title: str, content: str) -> str:
+    from core.taxonomy import get_taxonomy
+
+    taxonomy = get_taxonomy()
+    return _WEB_PROMPT_TPL.format(
+        url=url,
+        page_title=page_title,
+        content=content,
+        category_choice=taxonomy.category_choice_line(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -754,7 +766,7 @@ def analyze_webpage(url: str) -> dict:
                 "author": page_author, "post_date": page_date,
                 "error": "No readable text content found on the page"}
 
-    prompt = _WEB_PROMPT_TPL.format(
+    prompt = _build_web_prompt(
         url=url,
         page_title=page_title or "Unknown",
         content=content[:8000],

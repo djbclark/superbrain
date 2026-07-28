@@ -205,6 +205,17 @@ class Database:
             "analyses", "is_hidden", "INTEGER DEFAULT 0"
         )
 
+        # Category taxonomy metadata (additive; analyses.category remains canonical)
+        for _col, _decl in [
+            ("category_source", "TEXT"),
+            ("category_confidence", "REAL"),
+            ("category_rationale", "TEXT"),
+            ("category_suggestions_json", "TEXT"),
+            ("category_taxonomy_version", "TEXT"),
+            ("categorized_at", "TEXT"),
+        ]:
+            self._add_column_if_missing("analyses", _col, _decl)
+
         for _col, _dflt in [
             ("topic_url", "TEXT"),
             ("lease_expires_at", "TEXT"),
@@ -314,7 +325,9 @@ class Database:
     def save_analysis(self, shortcode, url, username, title, summary, tags, music, category,
                       visual_analysis="", audio_transcription="", text_analysis="",
                       likes=0, post_date=None, content_type="instagram", thumbnail="",
-                      transcript_mode=""):
+                      transcript_mode="", category_source=None, category_confidence=None,
+                      category_rationale=None, category_suggestions_json=None,
+                      category_taxonomy_version=None, categorized_at=None):
         """Insert or update an analysis record. Returns True on success."""
         if not self.is_connected():
             print("[WARNING] Database not connected. Analysis not saved.")
@@ -323,13 +336,19 @@ class Database:
             print(f"📝 Saving to database with shortcode: {shortcode}")
             now = _utcnow().isoformat()
             tags_json = json.dumps(tags if isinstance(tags, list) else tags.split())
+            cat_at = categorized_at or (now if category_source else None)
+            suggestions_json = category_suggestions_json
+            if suggestions_json is not None and not isinstance(suggestions_json, str):
+                suggestions_json = json.dumps(suggestions_json, ensure_ascii=False)
 
             self._conn.execute("""
                 INSERT INTO analyses
                     (shortcode, url, username, content_type, analyzed_at, updated_at, post_date, likes,
                      thumbnail, title, summary, tags, music, category,
-                     visual_analysis, audio_transcription, transcript_mode, text_analysis)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     visual_analysis, audio_transcription, transcript_mode, text_analysis,
+                     category_source, category_confidence, category_rationale,
+                     category_suggestions_json, category_taxonomy_version, categorized_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(shortcode) DO UPDATE SET
                     url                 = excluded.url,
                     username            = excluded.username,
@@ -346,10 +365,18 @@ class Database:
                     visual_analysis     = excluded.visual_analysis,
                     audio_transcription = excluded.audio_transcription,
                     transcript_mode     = excluded.transcript_mode,
-                    text_analysis       = excluded.text_analysis
+                    text_analysis       = excluded.text_analysis,
+                    category_source     = COALESCE(excluded.category_source, analyses.category_source),
+                    category_confidence = COALESCE(excluded.category_confidence, analyses.category_confidence),
+                    category_rationale  = COALESCE(excluded.category_rationale, analyses.category_rationale),
+                    category_suggestions_json = COALESCE(excluded.category_suggestions_json, analyses.category_suggestions_json),
+                    category_taxonomy_version = COALESCE(excluded.category_taxonomy_version, analyses.category_taxonomy_version),
+                    categorized_at      = COALESCE(excluded.categorized_at, analyses.categorized_at)
             """, (shortcode, url, username, content_type, now, now, post_date, likes,
                   thumbnail, title, summary, tags_json, music, category,
-                  visual_analysis, audio_transcription, transcript_mode, text_analysis))
+                  visual_analysis, audio_transcription, transcript_mode, text_analysis,
+                  category_source, category_confidence, category_rationale,
+                  suggestions_json, category_taxonomy_version, cat_at))
             self._conn.commit()
             print(f"[OK] Analysis saved to database ({shortcode})")
             return True
@@ -362,6 +389,75 @@ class Database:
             import traceback
             traceback.print_exc()
             return False
+
+    def update_category_metadata(self, shortcode, *, category, category_source=None,
+                                 category_confidence=None, category_rationale=None,
+                                 category_suggestions_json=None,
+                                 category_taxonomy_version=None, categorized_at=None):
+        """Update only category + taxonomy metadata for a post. Returns True if updated."""
+        if not self.is_connected():
+            return False
+        try:
+            now = _utcnow().isoformat()
+            suggestions_json = category_suggestions_json
+            if suggestions_json is not None and not isinstance(suggestions_json, str):
+                suggestions_json = json.dumps(suggestions_json, ensure_ascii=False)
+            cur = self._conn.execute(
+                """
+                UPDATE analyses SET
+                    category = ?,
+                    category_source = ?,
+                    category_confidence = ?,
+                    category_rationale = ?,
+                    category_suggestions_json = ?,
+                    category_taxonomy_version = ?,
+                    categorized_at = ?,
+                    updated_at = ?
+                WHERE shortcode = ?
+                """,
+                (
+                    category,
+                    category_source,
+                    category_confidence,
+                    category_rationale,
+                    suggestions_json,
+                    category_taxonomy_version,
+                    categorized_at or now,
+                    now,
+                    shortcode,
+                ),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+        except Exception as e:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            print(f"[WARNING]  Error updating category metadata: {e}")
+            return False
+
+    def list_visible_for_recategorize(self, limit=None, offset=0):
+        """Return light rows used by taxonomy migration (excludes soft-deleted)."""
+        if not self.is_connected():
+            return []
+        try:
+            cur = self._conn.cursor()
+            sql = (
+                "SELECT shortcode, title, summary, tags, category, "
+                "audio_transcription, text_analysis, visual_analysis "
+                "FROM analyses WHERE (is_hidden IS NULL OR is_hidden = 0) "
+                "ORDER BY shortcode"
+            )
+            params: list = []
+            if limit is not None:
+                sql += " LIMIT ? OFFSET ?"
+                params.extend([int(limit), int(offset)])
+            cur.execute(sql, params)
+            return [self._row_to_dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            print(f"[WARNING]  Error listing analyses for recategorize: {e}")
+            return []
 
     def get_recent(self, limit=10):
         """Return the most recently analysed posts (excludes soft-deleted)."""
@@ -909,7 +1005,8 @@ class Database:
 
         Args:
             shortcode: Instagram post shortcode
-            updates: dict of allowed fields (category, title, summary)
+            updates: dict of allowed fields (category, title, summary, and optional
+                     category metadata columns)
 
         Returns:
             bool: True if updated
@@ -917,9 +1014,27 @@ class Database:
         if not self.is_connected():
             return False
         try:
-            updates["updated_at"] = _utcnow().isoformat()
-            set_clause = ", ".join(f"{k} = ?" for k in updates)
-            values = list(updates.values()) + [shortcode]
+            allowed = {
+                "category",
+                "title",
+                "summary",
+                "category_source",
+                "category_confidence",
+                "category_rationale",
+                "category_suggestions_json",
+                "category_taxonomy_version",
+                "categorized_at",
+            }
+            filtered = {k: v for k, v in updates.items() if k in allowed}
+            if not filtered:
+                return False
+            if "category" in filtered and "category_source" not in filtered:
+                filtered["category_source"] = "manual"
+            if "category" in filtered and "categorized_at" not in filtered:
+                filtered["categorized_at"] = _utcnow().isoformat()
+            filtered["updated_at"] = _utcnow().isoformat()
+            set_clause = ", ".join(f"{k} = ?" for k in filtered)
+            values = list(filtered.values()) + [shortcode]
             cur = self._conn.execute(
                 f"UPDATE analyses SET {set_clause} WHERE shortcode = ?", values
             )

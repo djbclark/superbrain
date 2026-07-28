@@ -557,8 +557,11 @@ PROVIDER_ORDER = {
     "groq": 0,
     "gemini": 1,
     "openrouter": 2,
-    "ollama": 3,
-    "omlx": 4,
+    # Prefer the authenticated omlx server over the separate Ollama fallback.
+    # omlx is the locally validated text model used for degraded-provider
+    # playlist analysis; Ollama remains available if that service is down.
+    "omlx": 3,
+    "ollama": 4,
 }
 
 logger = logging.getLogger(__name__)
@@ -1309,7 +1312,7 @@ class ModelRouter:
         earliest_resume_dt = None
         provider_status = {}
 
-        for prov in ("groq", "gemini", "openrouter", "ollama", "omlx"):
+        for prov in ("groq", "gemini", "openrouter", "omlx", "ollama"):
             key_name = f"{prov.upper()}_API_KEY"
             if prov in ("groq", "gemini", "openrouter") and not self._key(key_name):
                 provider_status[prov] = "Missing API Key"
@@ -1589,5 +1592,4 @@ if __name__ == "__main__":
         router.refresh_models()
     else:
         router.print_rankings()
-
 

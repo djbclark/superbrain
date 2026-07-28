@@ -1,13 +1,18 @@
 # Config-driven category taxonomy proposal
 
-## Purpose
+## Implementation status (2026-07-28)
 
-Replace SuperBrain's fixed, code-owned category list with a user-owned taxonomy
-that can classify both new and existing analyses without downloading videos or
-re-running transcription. This proposal is intentionally an implementation
-plan, not an approved schema or prompt. The next implementation agent must do
-its own current prompting research and obtain operator confirmation before
-changing classification behavior.
+Landed in this fork:
+
+- `backend/core/taxonomy.py` + `backend/core/classifier.py`
+- `backend/config/categories.toml.example` (real `categories.toml` gitignored)
+- Additive SQLite category metadata columns
+- Analysis paths classify via config taxonomy (no keyword fallback)
+- `backend/scripts/recategorize.py` for backup / dry-run / apply / rollback
+- `category_manager.py` deprecated stub (MongoDB-era; exits with guidance)
+
+Live migration of existing rows still requires operator dry-run review before
+`recategorize.py apply`.
 
 ## Operator requirements captured so far
 
@@ -32,11 +37,12 @@ changing classification behavior.
 
 ## Current-state findings
 
-- `backend/main.py` contains a fixed `valid_categories` allow-list and a
-  keyword fallback. It cannot preserve newly configured names.
-- `backend/core/category_manager.py` is a MongoDB-era utility that references
-  `db.collection`; it is not compatible with the active SQLite database and
-  must not be used as the migration tool.
+- Analysis paths previously used a fixed `valid_categories` allow-list and a
+  keyword fallback in `backend/main.py`. That path is replaced by
+  config-driven classification.
+- `backend/core/category_manager.py` was a MongoDB-era utility that referenced
+  `db.collection`; it is now a deprecated stub and must not be used as the
+  migration tool.
 - The SQLite `analyses.category` field already supports a simple assigned
   category, and the mobile API supports updating one post at a time.
 - Existing analyses have title, summary, tags, transcript data, and current
