@@ -57,7 +57,7 @@ def generate_final_summary(results, instagram_url):
     audio_summary = ""
     music_info = ""
     text_summary = ""
-    
+
     # Extract visual analysis
     if results['visual']:
         visual_summary = "VISUAL ANALYSIS:\n"
@@ -66,7 +66,7 @@ def generate_final_summary(results, instagram_url):
             clean = _clean_visual(output)
             if clean:
                 visual_summary += f"- {clean[:600]}\n"
-    
+
     # Extract audio transcription
     if results['audio_transcription']:
         audio_summary = "AUDIO TRANSCRIPTION:\n"
@@ -77,7 +77,7 @@ def generate_final_summary(results, instagram_url):
             audio_summary += f"- Language: {lang}\n"
             if clean:
                 audio_summary += f"- Content: {clean[:400]}\n"
-    
+
     # Extract music identification
     if results['music_identification']:
         music_info = "MUSIC:\n"
@@ -86,13 +86,13 @@ def generate_final_summary(results, instagram_url):
             if 'Song:' in output:
                 song_line = [line for line in output.split('\n') if 'Song:' in line][0]
                 artist_line = [line for line in output.split('\n') if 'Artist:' in line]
-                
+
                 song = song_line.split('Song:')[1].strip()
                 artist = artist_line[0].split('Artist:')[1].strip() if artist_line else 'Unknown'
                 music_info += f"- {song} by {artist}\n"
             elif 'No match found' in output:
                 music_info += "- No music identified (likely voiceover/no background music)\n"
-    
+
     # Extract text analysis
     if results['text']:
         text_summary = "TEXT ANALYSIS:\n"
@@ -100,7 +100,7 @@ def generate_final_summary(results, instagram_url):
             clean = _clean_text(item['output'])
             if clean:
                 text_summary += f"{clean[:600]}\n"
-    
+
     # Combine all information
     combined_info = f"""
 INSTAGRAM POST: {instagram_url}
@@ -113,7 +113,7 @@ INSTAGRAM POST: {instagram_url}
 
 {text_summary}
 """
-    
+
     # Generate structured summary using LLM
     prompt = f"""Based on the following analysis of an Instagram post, create a comprehensive structured summary.
 
@@ -261,12 +261,12 @@ def parse_summary(summary_text):
 def auto_detect_category(summary_text, title, summary, tags):
     """
     Auto-detect category based on content keywords
-    
+
     Returns:
         str: Detected category
     """
     combined = f"{title} {summary} {' '.join(tags)} {summary_text}".lower()
-    
+
     # Category keywords
     category_keywords = {
         'product': ['camera', 'device', 'gadget', 'tech', 'phone', 'laptop', 'review', 'unbox', 'product', 'dji', 'osmo', 'action cam'],
@@ -279,19 +279,19 @@ def auto_detect_category(summary_text, title, summary, tags):
         'tv shows': ['series', 'episode', 'season', 'show', 'tv show', 'streaming', 'netflix'],
         'event': ['event', 'concert', 'festival', 'conference', 'meetup', 'workshop', 'seminar']
     }
-    
+
     # Count keyword matches
     scores = {}
     for category, keywords in category_keywords.items():
         score = sum(1 for keyword in keywords if keyword in combined)
         scores[category] = score
-    
+
     # Get category with highest score
     best_category = max(scores, key=scores.get)
-    
+
     if scores[best_category] > 0:
         return best_category
-    
+
     return "other"
 
 def run_script(script_name, args):
@@ -299,11 +299,11 @@ def run_script(script_name, args):
     try:
         # Use sys.executable to ensure same Python interpreter (virtual env)
         cmd = [sys.executable, os.path.join(os.path.dirname(__file__), script_name)] + args
-        
+
         # Force UTF-8 encoding for subprocess
         env = os.environ.copy()
         env['PYTHONIOENCODING'] = 'utf-8'
-        
+
         result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', env=env)
         return result.returncode == 0, result.stdout, result.stderr
     except Exception as e:
@@ -312,23 +312,23 @@ def run_script(script_name, args):
 def run_analysis_task(task_name, script_name, file_path, task_type="light"):
     """
     Run a single analysis task (for parallel execution)
-    
+
     Args:
         task_name: Display name (e.g., "Visual Analysis")
         script_name: Python script to run
         file_path: Path to file to analyze
         task_type: "heavy" or "light" (for scheduling)
-    
+
     Returns:
         dict with task results
     """
     start_time = time.time()
     print(f"  ⚡ Starting {task_name}: {Path(file_path).name}")
-    
+
     success, stdout, stderr = run_script(script_name, [str(file_path)])
-    
+
     elapsed = time.time() - start_time
-    
+
     result = {
         'task_name': task_name,
         'file': Path(file_path).name,
@@ -338,12 +338,12 @@ def run_analysis_task(task_name, script_name, file_path, task_type="light"):
         'elapsed': elapsed,
         'type': task_type
     }
-    
+
     if success:
         print(f"  ✓ Completed {task_name}: {Path(file_path).name} ({elapsed:.1f}s)")
     else:
         print(f"  ✗ Failed {task_name}: {Path(file_path).name}")
-    
+
     return result
 
 def _extract_section(output: str, marker: str) -> str:
@@ -468,13 +468,24 @@ def _sanitise_yt_raw(raw: str, post_date: str | None) -> str:
 
     return result
 
-def run_youtube_analysis(url: str, shortcode: str, db):
-    """Single-call YouTube analysis via Gemini native video support."""
+def run_youtube_analysis(
+    url: str,
+    shortcode: str,
+    db,
+    use_native_subtitles: bool = False,
+    transcribe_seconds: int = 0,
+    cookies: str | None = None,
+):
+    """Single-call YouTube analysis via Gemini native video support / Groq fallback."""
     print_section("🎬 YouTube Video Analysis")
     print(f"📹 Analyzing: {url}")
-    print("   (Gemini will access the video directly — no download required)")
 
-    result = analyze_youtube(url)
+    result = analyze_youtube(
+        url,
+        use_native_subtitles=use_native_subtitles,
+        transcribe_seconds=transcribe_seconds,
+        cookies=cookies,
+    )
 
     if result.get('error'):
         err = result['error']
@@ -497,12 +508,14 @@ def run_youtube_analysis(url: str, shortcode: str, db):
     print(raw[:2000])
 
     title, summary_text, tags, music, category = parse_summary(raw)
+    if not title and result.get('title'):
+        title = result['title']
 
     # Use upload date scraped directly from YouTube page (always accurate)
     yt_post_date = result.get('post_date')
 
     print_section("💾 Saving to Database")
-    db.save_analysis(
+    saved = db.save_analysis(
         shortcode=shortcode,
         url=url,
         username=result.get('channel', ''),
@@ -512,12 +525,16 @@ def run_youtube_analysis(url: str, shortcode: str, db):
         music=music,
         category=category,
         visual_analysis='',
-        audio_transcription='',
+        audio_transcription=result.get("transcript_text", ""),
+        transcript_mode=result.get("transcript_mode", ""),
         text_analysis=raw,
         content_type='youtube',
         thumbnail=result.get('thumbnail', ''),
         post_date=yt_post_date,
     )
+    if not saved:
+        print(f"❌ YouTube analysis completed but could not be persisted ({shortcode})")
+        return
     print(f"✓ YouTube analysis saved ({shortcode})")
     print_header("✅ Done — YouTube Analysis Complete")
     return True
@@ -579,20 +596,74 @@ def run_webpage_analysis(url: str, shortcode: str, db):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    """Main orchestrator"""
+    import argparse
+    from analyzers.playlist_analyzer import (
+        PlaylistLockUnavailable,
+        ensure_ytdlp_or_exit,
+        run_playlist_import,
+    )
 
-    print_header("🧠 SUPERBRAIN - Content Analyzer")
-    
-    # Step 1: Get URL
-    if len(sys.argv) > 1:
-        instagram_url = sys.argv[1]
-        print(f"📎 Link: {instagram_url}")
-    else:
-        instagram_url = input("📎 Enter URL (Instagram / YouTube / web page): ").strip()
+    parser = argparse.ArgumentParser(description="SuperBrain Content Analyzer")
+    parser.add_argument("url", nargs="?", default="", help="URL to analyze (Instagram / YouTube / Web / Playlist)")
+    parser.add_argument("-p", "--playlist", help="URL of a YouTube playlist to import and analyze")
+    parser.add_argument("-c", "--cookies", help="Cookies for yt-dlp (browser name like 'chrome' or path to cookies.txt)")
+    parser.add_argument("-s", "--start-index", type=int, default=1, help="Start processing playlist at 1-based index (default: 1)")
+    parser.add_argument("-j", "--workers", "--parallel", type=int, default=1, help="Number of parallel workers (default: 1 = one at a time)")
+    parser.add_argument("--all-at-once", action="store_true", default=False, help="Process all playlist items concurrently at once (5 workers)")
+    parser.add_argument("-y", "--youtube-transcripts", action="store_true", default=False, help="Enable YouTube native transcript extraction")
+    parser.add_argument("-m", "--transcribe-seconds", type=int, default=0, help="Duration of audio to transcribe in seconds (default: 0 = full video audio)")
 
-    if not instagram_url:
+    args = parser.parse_args()
+
+    if args.start_index < 1:
+        parser.error("--start-index must be at least 1")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if args.transcribe_seconds < 0:
+        parser.error("--transcribe-seconds cannot be negative")
+
+    # Enable instant real-time line buffering when any of our new flags are used
+    if args.playlist or args.youtube_transcripts or (args.transcribe_seconds and args.transcribe_seconds > 0) or args.all_at_once or args.workers > 1:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(line_buffering=True)
+            sys.stderr.reconfigure(line_buffering=True)
+
+    target_url = args.playlist or args.url
+    if not target_url:
+        target_url = input("📎 Enter URL (Instagram / YouTube / Playlist / web page): ").strip()
+
+    if not target_url:
         print("❌ No link provided!")
         sys.exit(1)
+
+    use_native_transcripts = args.youtube_transcripts
+    transcribe_seconds = args.transcribe_seconds
+    workers = 5 if args.all_at_once else args.workers
+
+    # Check if this is a playlist request
+    is_playlist = args.playlist is not None or (
+        "list=" in target_url and "watch?v=" not in target_url
+    )
+    if is_playlist:
+        try:
+            run_playlist_import(
+                target_url,
+                cookies=args.cookies,
+                start_index=args.start_index,
+                use_native_transcripts=use_native_transcripts,
+                transcribe_seconds=transcribe_seconds,
+                workers=workers,
+            )
+        except PlaylistLockUnavailable:
+            sys.exit(3)
+        return
+
+    # Check yt-dlp availability for single YouTube link
+    validation = validate_link(target_url)
+    if validation.get('valid') and validation.get('content_type') == 'youtube':
+        ensure_ytdlp_or_exit()
+
+    instagram_url = target_url
 
     # Step 2: Validate link & detect type
     print_section("🔍 Step 1: Validating Link")
@@ -611,17 +682,17 @@ def main():
 
     print(f"✓ Valid {content_type} link")
     print(f"  ID: {shortcode}")
-    
+
     # Step 2.5: Check cache in database
     print_section("🔍 Step 2: Checking Cache")
-    
+
     db = get_db()
     cached = db.check_cache(shortcode) if db.is_connected() else None
-    
+
     if cached:
         print(f"✓ Found in cache! (Analyzed on {cached.get('analyzed_at', 'unknown')})")
         print(f"  Returning cached result...\n")
-        
+
         # Display cached summary
         print_section("📋 CACHED RESULT")
         print(f"📌 TITLE:\n{cached.get('title', 'N/A')}\n")
@@ -638,7 +709,14 @@ def main():
 
     # ── Dispatch non-Instagram types ──────────────────────────────────────────
     if content_type == 'youtube':
-        result = run_youtube_analysis(instagram_url, shortcode, db)
+        result = run_youtube_analysis(
+            instagram_url,
+            shortcode,
+            db,
+            use_native_subtitles=use_native_transcripts,
+            transcribe_seconds=transcribe_seconds,
+            cookies=args.cookies,
+        )
         if result == RETRY_SENTINEL:
             sys.exit(2)
         if result is None:
@@ -657,23 +735,23 @@ def main():
 
     # Step 3: Download content
     print_section("📥 Step 3: Downloading Content")
-    
+
     print("Running Instagram downloader...")
-    
+
     try:
         # Pass URL via stdin simulation
         import contextlib
         from io import StringIO
-        
+
         # Import the downloader function
         from instagram.instagram_downloader import download_instagram_content, RetryableDownloadError
-        
+
         download_result = download_instagram_content(instagram_url)
-        
+
         if download_result is None:
             print("❌ Download failed!")
             sys.exit(1)
-        
+
         download_folder = download_result
         print(f"\n✓ Content downloaded to: {download_folder}")
 
@@ -687,53 +765,53 @@ def main():
         db.queue_for_retry(shortcode, instagram_url, 'instagram', 'instagram_rate_limit', retry_hours=24)
         print("⏰ Queued for retry in 24 hours.")
         sys.exit(2)
-        
+
     except Exception as e:
         print(f"❌ Download error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
-    
+
     # Step 4: Find downloaded files
     print_section("📂 Step 3: Locating Files")
-    
+
     folder_path = Path(download_folder)
-    
+
     if not folder_path.exists():
         print(f"❌ Folder not found: {download_folder}")
         sys.exit(1)
-    
+
     # Find files
     mp4_files = list(folder_path.glob("*.mp4"))
     mp3_files = list(folder_path.glob("*_audio.mp3"))
     jpg_files = list(folder_path.glob("*.jpg"))
     info_files = list(folder_path.glob("info.txt"))
-    
+
     print(f"📹 Videos: {len(mp4_files)}")
     print(f"🎵 Audio files: {len(mp3_files)}")
     print(f"🖼️  Images: {len(jpg_files)}")
     print(f"📄 Info files: {len(info_files)}")
-    
+
     # Step 5: Run analyses with SMART PARALLEL PROCESSING
     print_section("🚀 Step 4: Running Parallel Analysis")
     print("Strategy: Heavy tasks sequential, light tasks parallel")
     print("Heavy: Visual (video processing), Audio (Whisper)")
     print("Light: Music (Shazam), Text (metadata)")
-    
+
     results = {
         'visual': [],
         'audio_transcription': [],
         'music_identification': [],
         'text': []
     }
-    
+
     all_tasks = []
     analysis_start = time.time()
-    
+
     # === PHASE 1: Visual Analysis (HEAVY) - Run alone ===
     if mp4_files or jpg_files:
         print(f"\n🎬 Phase 1: Visual Analysis (Heavy Task)")
-        
+
         for video in mp4_files:
             result = run_analysis_task("Visual", 'analyzers/visual_analyze.py', str(video), "heavy")
             if result['success']:
@@ -743,7 +821,7 @@ def main():
                     'output': result['output']
                 })
                 print(_clean_visual(result['output'])[:600] + "\n")
-        
+
         for img in jpg_files:
             result = run_analysis_task("Visual", 'analyzers/visual_analyze.py', str(img), "heavy")
             if result['success']:
@@ -753,11 +831,11 @@ def main():
                     'output': result['output']
                 })
                 print(_clean_visual(result['output'])[:600] + "\n")
-    
+
     # === PHASE 2: Audio Transcription (HEAVY) - Run alone ===
     if mp3_files:
         print(f"\n🎙️ Phase 2: Audio Transcription (Heavy Task)")
-        
+
         for audio in mp3_files:
             result = run_analysis_task("Audio", 'analyzers/audio_transcribe.py', str(audio), "heavy")
             if result['success']:
@@ -766,35 +844,35 @@ def main():
                     'output': result['output']
                 })
                 print(_clean_audio(result['output'])[:600] + "\n")
-    
+
     # === PHASE 3: Light tasks in PARALLEL ===
     print(f"\n⚡ Phase 3: Light Tasks (Parallel Execution)")
-    
+
     light_tasks = []
-    
+
     # Add music identification tasks
     for audio in mp3_files:
         light_tasks.append(('music', 'analyzers/music_identifier.py', str(audio)))
-    
+
     # Add text analysis tasks
     for info_file in info_files:
         light_tasks.append(('text', 'analyzers/text_analyzer.py', str(info_file)))
-    
+
     if light_tasks:
         # Run light tasks in parallel (max 3 concurrent)
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {}
-            
+
             for task_type, script, file_path in light_tasks:
                 task_name = "Music ID" if task_type == 'music' else "Text"
                 future = executor.submit(run_analysis_task, task_name, script, file_path, "light")
                 futures[future] = task_type
-            
+
             # Collect results as they complete
             for future in as_completed(futures):
                 task_type = futures[future]
                 result = future.result()
-                
+
                 if result['success']:
                     if task_type == 'music':
                         results['music_identification'].append({
@@ -806,26 +884,26 @@ def main():
                             'file': result['file'],
                             'output': result['output']
                         })
-                    
+
                     if task_type == 'music':
                         print(result['output'][:400] + "\n")
                     else:
                         print(_clean_text(result['output'])[:600] + "\n")
-    
+
     analysis_elapsed = time.time() - analysis_start
     print(f"\n⏱️  Total Analysis Time: {analysis_elapsed:.1f}s")
-    
+
     # Final comprehensive summary
     print_header("✅ GENERATING COMPREHENSIVE SUMMARY")
-    
+
     final_summary = generate_final_summary(results, instagram_url)
-    
+
     print_section("📋 FINAL REPORT")
     print(final_summary)
-    
+
     # Extract structured data from summary for database
     title, summary_text, tags, music, category = parse_summary(final_summary)
-    
+
     # OVERRIDE LLM MUSIC WITH DIRECT SHAZAM OUTPUT TO PRESERVE LINKS
     if results.get('music_identification'):
         for item in results['music_identification']:
@@ -849,12 +927,12 @@ def main():
                 music = "No music identified"
                 break
 
-    
+
     # Get additional metadata from info.txt if available
     username = ""
     likes = 0
     post_date = None
-    
+
     if info_files:
         try:
             with open(info_files[0], 'r', encoding='utf-8') as f:
@@ -862,7 +940,7 @@ def main():
                 username_match = re.search(r'Username: @(\S+)', content)
                 likes_match = re.search(r'Likes: (\d+)', content)
                 date_match = re.search(r'Date: ([\d\-: ]+)', content)
-                
+
                 if username_match:
                     username = username_match.group(1)
                 if likes_match:
@@ -871,7 +949,7 @@ def main():
                     post_date = date_match.group(1)
         except:
             pass
-    
+
     # Save to database
     print_section("💾 Saving to Database")
 
@@ -925,17 +1003,17 @@ def main():
         post_date=post_date,
         thumbnail=instagram_thumbnail,
     )
-    
+
     print(f"✓ Analysis saved to database")
-    
+
     # Step 8: Cleanup temp folder
     print_section("🧹 Step 5: Cleanup")
-    
+
     if cleanup_temp_folder(download_folder):
         print(f"✓ Temp folder deleted successfully")
     else:
         print(f"⚠ Temp folder not deleted (may need manual cleanup)")
-    
+
     print("\n" + "=" * 80)
     print(f"📊 Analyses Complete: Visual({len(results['visual'])}), Audio({len(results['audio_transcription'])}), Music({len(results['music_identification'])}), Text({len(results['text'])})")
     print(f"⏱️  Total Time: {analysis_elapsed:.1f}s")

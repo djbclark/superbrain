@@ -14,17 +14,16 @@ Inspired by / referencing:
     Google + Groq + OpenRouter unified approach
   • openrouter-free-model (jomonylw) — free model detection logic
 
-Priority order (defaults, adjusted dynamically by measured latency):
-  TEXT:   Groq → Gemini → OpenRouter (hardcoded best) → Dynamic free OpenRouter → Local Ollama
-  VISION: Gemini → Groq Vision → OpenRouter Vision → Local Ollama Vision
+Provider failover order:
+  Groq → Gemini → OpenRouter → Ollama → local omlx
 
-API keys — store in backend/.api_keys (gitignored), one per line:
+API keys can come from the environment or config/.api_keys (gitignored):
     GROQ_API_KEY=gsk_...
     GEMINI_API_KEY=AIza...
     OPENROUTER_API_KEY=sk-or-...
 
-Performance state persisted to backend/model_rankings.json (rankings survive restarts).
-Dynamic model list cached in backend/openrouter_free_models.json (refreshed every 6 h).
+Performance state and the dynamic OpenRouter cache are written to XDG state/cache
+directories (or SUPERBRAIN_STATE_DIR / SUPERBRAIN_CACHE_DIR), not tracked config.
 
 CLI:
   python model_router.py                  → show rankings
@@ -35,15 +34,34 @@ CLI:
 import os
 import json
 import time
-import base64
 import threading
+import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+
+def _utcnow():
+    """Return naive UTC for compatibility with existing persisted timestamps."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 CONFIG_DIR    = Path(__file__).resolve().parent.parent / "config"
-RANKINGS_FILE = CONFIG_DIR / "model_rankings.json"
 API_KEYS_FILE = CONFIG_DIR / ".api_keys"
+STATE_DIR = Path(
+    os.getenv(
+        "SUPERBRAIN_STATE_DIR",
+        Path(os.getenv("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+        / "superbrain",
+    )
+)
+CACHE_DIR = Path(
+    os.getenv(
+        "SUPERBRAIN_CACHE_DIR",
+        Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache")) / "superbrain",
+    )
+)
+RANKINGS_FILE = STATE_DIR / "model_rankings.json"
+LEGACY_RANKINGS_FILE = CONFIG_DIR / "model_rankings.json"
 
 # How long to cool-down a failing model before retrying (seconds)
 MODEL_DOWN_COOLDOWN_S   = 300    # generic errors (5 min)
@@ -52,7 +70,8 @@ MODEL_RATE_LIMIT_COOLDOWN_S = 1800  # HTTP 429 rate-limit (30 min) — FreeRide 
 EMA_ALPHA = 0.3
 
 # Cache file for dynamically discovered free OpenRouter models (FreeRide approach)
-OPENROUTER_FREE_CACHE_FILE  = CONFIG_DIR / "openrouter_free_models.json"
+OPENROUTER_FREE_CACHE_FILE  = CACHE_DIR / "openrouter_free_models.json"
+LEGACY_OPENROUTER_FREE_CACHE_FILE = CONFIG_DIR / "openrouter_free_models.json"
 OPENROUTER_FREE_CACHE_HOURS = 6   # re-fetch every 6 h
 OPENROUTER_API_MODELS_URL   = "https://openrouter.ai/api/v1/models"
 
@@ -127,6 +146,14 @@ MODELS: List[Dict[str, Any]] = [
         "desc": "Groq GPT-OSS 120B — flagship 120B model, 500 t/s",
     },
     {
+        "key": "groq_qwen36_27b",
+        "provider": "groq",
+        "model_id": "qwen/qwen3.6-27b",
+        "type": "text",
+        "base_priority": 3.2,
+        "desc": "Groq Qwen 3.6 27B — current supported quality fallback",
+    },
+    {
         "key": "groq_gemma2_9b",
         "provider": "groq",
         "model_id": "gemma2-9b-it",
@@ -149,6 +176,30 @@ MODELS: List[Dict[str, Any]] = [
         "type": "text",
         "base_priority": 4,
         "desc": "Gemini 2.5 Flash — best price-performance, low-latency with reasoning",
+    },
+    {
+        "key": "gemini_36_flash",
+        "provider": "gemini",
+        "model_id": "gemini-3.6-flash",
+        "type": "text",
+        "base_priority": 3.9,
+        "desc": "Gemini 3.6 Flash — current stable Flash model",
+    },
+    {
+        "key": "gemini_35_flash_lite",
+        "provider": "gemini",
+        "model_id": "gemini-3.5-flash-lite",
+        "type": "text",
+        "base_priority": 4.1,
+        "desc": "Gemini 3.5 Flash-Lite — current high-volume model",
+    },
+    {
+        "key": "gemini_35_flash",
+        "provider": "gemini",
+        "model_id": "gemini-3.5-flash",
+        "type": "text",
+        "base_priority": 4.2,
+        "desc": "Gemini 3.5 Flash — current general-purpose model",
     },
     {
         "key": "gemini_25_flash_lite",
@@ -327,6 +378,14 @@ MODELS: List[Dict[str, Any]] = [
         "base_priority": 100,
         "desc": "Local Ollama Qwen3-VL 4B — LAST RESORT (requires Ollama running)",
     },
+    {
+        "key": "local_omlx",
+        "provider": "omlx",
+        "model_id": "omlx-local",
+        "type": "text",
+        "base_priority": 90,
+        "desc": "Local MLX Inference Server (omlx) on http://localhost:8000",
+    },
 
     # ── VISION ───────────────────────────────────────────────────────────────
     {
@@ -478,6 +537,32 @@ MODELS: List[Dict[str, Any]] = [
 
 MODELS_BY_KEY: Dict[str, Dict] = {m["key"]: m for m in MODELS}
 
+# Provider lifecycle lists are intentionally centralized so retired endpoints
+# and announced shutdowns are skipped without losing persisted history.
+RETIRED_MODEL_IDS = {
+    "gemma2-9b-it",
+    "deepseek-r1-distill-qwen-32b",
+    "qwen/qwen3-32b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-preview",
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+}
+
+PROVIDER_ORDER = {
+    "groq": 0,
+    "gemini": 1,
+    "openrouter": 2,
+    "ollama": 3,
+    "omlx": 4,
+}
+
+logger = logging.getLogger(__name__)
+
 
 def _has_image_input(m: Dict) -> bool:
     """Return True if an OpenRouter model object supports image (vision) input."""
@@ -521,12 +606,7 @@ class ModelRouter:
     # ── Configuration ─────────────────────────────────────────────────────────
 
     def _load_api_keys(self):
-        """Load API keys from environment and .api_keys file."""
-        for k in ("GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"):
-            v = os.environ.get(k)
-            if v:
-                self._api_keys[k] = v
-
+        """Load ignored file defaults, then let injected environment values win."""
         if API_KEYS_FILE.exists():
             with open(API_KEYS_FILE, "r") as f:
                 for line in f:
@@ -534,6 +614,20 @@ class ModelRouter:
                     if line and not line.startswith("#") and "=" in line:
                         k, v = line.split("=", 1)
                         self._api_keys[k.strip()] = v.strip()
+        for k, v in os.environ.items():
+            if v and (
+                k.endswith("_API_KEY")
+                or k
+                in {
+                    "DISABLE_OLLAMA",
+                    "DISABLE_OMLX",
+                    "OLLAMA_HOST",
+                    "OLLAMA_HOSTS",
+                    "OLLAMA_BASE_URL",
+                    "OMLX_HOST",
+                }
+            ):
+                self._api_keys[k] = v
 
     def _key(self, name: str) -> Optional[str]:
         return self._api_keys.get(name) or None
@@ -550,20 +644,21 @@ class ModelRouter:
             "groq": bool(self._key("GROQ_API_KEY")),
             "gemini": bool(self._key("GEMINI_API_KEY")),
             "openrouter": bool(self._key("OPENROUTER_API_KEY")),
-            "ollama": True,  # Always available
+            "ollama": not (self._key("DISABLE_OLLAMA") == "1" or os.environ.get("DISABLE_OLLAMA") == "1"),
+            "omlx": not (self._key("DISABLE_OMLX") == "1" or os.environ.get("DISABLE_OMLX") == "1"),
         }
 
     def set_api_key(self, provider: str, api_key: str) -> bool:
         """Set an API key for a provider and persist to file."""
         key_name = f"{provider.upper()}_API_KEY"
         valid_providers = ["GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"]
-        
+
         if key_name not in valid_providers:
             return False
-        
+
         # Update in-memory
         self._api_keys[key_name] = api_key
-        
+
         # Persist to file
         self._persist_api_key(key_name, api_key)
         return True
@@ -572,13 +667,13 @@ class ModelRouter:
         """Delete an API key for a provider."""
         key_name = f"{provider.upper()}_API_KEY"
         valid_providers = ["GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"]
-        
+
         if key_name not in valid_providers:
             return False
-        
+
         # Remove from memory
         self._api_keys.pop(key_name, None)
-        
+
         # Remove from file
         self._remove_api_key(key_name)
         return True
@@ -587,7 +682,7 @@ class ModelRouter:
         """Persist an API key to the .api_keys file."""
         lines = []
         updated = False
-        
+
         if API_KEYS_FILE.exists():
             with open(API_KEYS_FILE, "r") as f:
                 for line in f:
@@ -596,10 +691,10 @@ class ModelRouter:
                         updated = True
                     else:
                         lines.append(line)
-        
+
         if not updated:
             lines.append(f"{key_name}={api_key}\n")
-        
+
         with open(API_KEYS_FILE, "w") as f:
             f.writelines(lines)
 
@@ -607,13 +702,13 @@ class ModelRouter:
         """Remove an API key from the .api_keys file."""
         if not API_KEYS_FILE.exists():
             return
-        
+
         lines = []
         with open(API_KEYS_FILE, "r") as f:
             for line in f:
                 if not line.strip().startswith(f"{key_name}="):
                     lines.append(line)
-        
+
         with open(API_KEYS_FILE, "w") as f:
             f.writelines(lines)
 
@@ -680,18 +775,21 @@ class ModelRouter:
         if not api_key:
             return  # No key → skip
 
-        # Check cache freshness
+        # Check runtime cache freshness, with a read-only legacy fallback.
         try:
-            if OPENROUTER_FREE_CACHE_FILE.exists():
-                cache = json.loads(OPENROUTER_FREE_CACHE_FILE.read_text())
+            cache_file = OPENROUTER_FREE_CACHE_FILE
+            if not cache_file.exists() and LEGACY_OPENROUTER_FREE_CACHE_FILE.exists():
+                cache_file = LEGACY_OPENROUTER_FREE_CACHE_FILE
+            if cache_file.exists():
+                cache = json.loads(cache_file.read_text())
                 cached_at = datetime.fromisoformat(cache.get("cached_at", "2000-01-01"))
-                if (datetime.utcnow() - cached_at).total_seconds() < OPENROUTER_FREE_CACHE_HOURS * 3600:
+                if (_utcnow() - cached_at).total_seconds() < OPENROUTER_FREE_CACHE_HOURS * 3600:
                     models = cache.get("models", [])
                     self._inject_dynamic_models(models)
                     vision_count = sum(1 for m in models if _has_image_input(m))
                     next_refresh_m = int(
                         (OPENROUTER_FREE_CACHE_HOURS * 3600
-                         - (datetime.utcnow() - cached_at).total_seconds()) / 60
+                         - (_utcnow() - cached_at).total_seconds()) / 60
                     )
                     print(f"🔄 OpenRouter free models: loaded {len(models)} from cache "
                           f"({vision_count} vision-capable) — next refresh in ~{next_refresh_m}m")
@@ -737,8 +835,9 @@ class ModelRouter:
 
         # Persist cache
         try:
+            OPENROUTER_FREE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
             OPENROUTER_FREE_CACHE_FILE.write_text(json.dumps({
-                "cached_at": datetime.utcnow().isoformat(),
+                "cached_at": _utcnow().isoformat(),
                 "models": top,
             }, indent=2))
         except Exception:
@@ -813,9 +912,12 @@ class ModelRouter:
         return self._default_model_state_dynamic(model_key)
 
     def _load_state(self):
-        if RANKINGS_FILE.exists():
+        source = RANKINGS_FILE
+        if not source.exists() and LEGACY_RANKINGS_FILE.exists():
+            source = LEGACY_RANKINGS_FILE
+        if source.exists():
             try:
-                with open(RANKINGS_FILE, "r") as f:
+                with open(source, "r") as f:
                     saved = json.load(f)
                 for key in MODELS_BY_KEY:
                     self._state[key] = saved.get(key, self._default_model_state(key))
@@ -827,6 +929,7 @@ class ModelRouter:
 
     def _save_state(self):
         try:
+            RANKINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(RANKINGS_FILE, "w") as f:
                 json.dump(self._state, f, indent=2, default=str)
         except Exception:
@@ -848,11 +951,17 @@ class ModelRouter:
             return False
         if prov == "openrouter" and not self._key("OPENROUTER_API_KEY"):
             return False
+        if m["model_id"] in RETIRED_MODEL_IDS:
+            return False
+        if prov == "ollama" and (self._key("DISABLE_OLLAMA") == "1" or os.environ.get("DISABLE_OLLAMA") == "1"):
+            return False
+        if prov == "omlx" and (self._key("DISABLE_OMLX") == "1" or os.environ.get("DISABLE_OMLX") == "1"):
+            return False
 
         s = self._state.get(model_key, self._default_model_state_dynamic(model_key))
         if s.get("down_until"):
             try:
-                if datetime.utcnow() < datetime.fromisoformat(s["down_until"]):
+                if _utcnow() < datetime.fromisoformat(s["down_until"]):
                     return False
             except Exception:
                 pass
@@ -890,7 +999,19 @@ class ModelRouter:
                     and k not in MODELS_BY_KEY  # don't double-count
                 ]
         all_candidates = static_candidates + dynamic_candidates
-        return sorted(all_candidates, key=self._effective_priority)
+
+        return sorted(
+            all_candidates,
+            key=lambda key: (
+                PROVIDER_ORDER.get(
+                    (MODELS_BY_KEY.get(key) or self._dynamic_models.get(key))[
+                        "provider"
+                    ],
+                    99,
+                ),
+                self._effective_priority(key),
+            ),
+        )
 
     # ── State recording ────────────────────────────────────────────────────────
 
@@ -907,7 +1028,7 @@ class ModelRouter:
             )
             s["success_count"] = s.get("success_count", 0) + 1
             s["down_until"] = None
-            s["last_used"] = datetime.utcnow().isoformat()
+            s["last_used"] = _utcnow().isoformat()
             s["last_error"] = None
             self._save_state()
 
@@ -930,7 +1051,7 @@ class ModelRouter:
             s["fail_count"] = s.get("fail_count", 0) + 1
             s["last_error"] = str(error)[:200]
             s["down_until"] = (
-                datetime.utcnow() + timedelta(seconds=cooldown)
+                _utcnow() + timedelta(seconds=cooldown)
             ).isoformat()
             self._save_state()
         print(
@@ -970,28 +1091,38 @@ class ModelRouter:
         return r.choices[0].message.content.strip()
 
     def _gemini_text(self, model_id: str, prompt: str) -> str:
-        import google.generativeai as genai
-        genai.configure(api_key=self._key("GEMINI_API_KEY"))
-        model = genai.GenerativeModel(model_id)
-        r = model.generate_content(
-            prompt,
-            generation_config={"max_output_tokens": 800, "temperature": 0.7},
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=self._key("GEMINI_API_KEY"))
+        response = client.models.generate_content(
+            model=model_id,
+            contents=prompt,
+            config=types.GenerateContentConfig(max_output_tokens=800),
         )
-        return r.text.strip()
+        return response.text.strip()
 
     def _gemini_vision(self, model_id: str, prompt: str, images_b64: List[str]) -> str:
-        import google.generativeai as genai
-        genai.configure(api_key=self._key("GEMINI_API_KEY"))
-        model = genai.GenerativeModel(model_id)
-        parts: List[Any] = []
-        for b64 in images_b64:
-            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64}})
+        import base64
+
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=self._key("GEMINI_API_KEY"))
+        parts = [
+            types.Part.from_bytes(
+                data=base64.b64decode(encoded_image, validate=True),
+                mime_type="image/jpeg",
+            )
+            for encoded_image in images_b64
+        ]
         parts.append(prompt)
-        r = model.generate_content(
-            parts,
-            generation_config={"max_output_tokens": 800, "temperature": 0.7},
+        response = client.models.generate_content(
+            model=model_id,
+            contents=parts,
+            config=types.GenerateContentConfig(max_output_tokens=800),
         )
-        return r.text.strip()
+        return response.text.strip()
 
     def _openrouter_text(self, model_id: str, prompt: str) -> str:
         import requests
@@ -1046,28 +1177,215 @@ class ModelRouter:
         if resp.status_code == 429:
             raise Exception(f"429 rate limit: {resp.text[:200]}")
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+    def _get_local_hosts(self) -> List[str]:
+        """Return explicitly configured Ollama hosts followed by localhost."""
+        env_host = self._key("OLLAMA_HOST") or os.environ.get("OLLAMA_HOST") or os.environ.get("OLLAMA_BASE_URL")
+        hosts = []
+        configured_hosts = self._key("OLLAMA_HOSTS") or os.environ.get("OLLAMA_HOSTS")
+        if configured_hosts:
+            hosts.extend(
+                host.strip().rstrip("/")
+                for host in configured_hosts.split(",")
+                if host.strip()
+            )
+        if env_host:
+            hosts.append(env_host.rstrip("/"))
+        hosts.append("http://localhost:11434")
+        return list(dict.fromkeys(hosts))
 
     def _ollama_text(self, model_id: str, prompt: str) -> str:
-        import ollama
-        r = ollama.generate(
-            model=model_id,
-            prompt=prompt,
-            options={"temperature": 0.7, "num_predict": 800},
-        )
-        return r.get("response", "").strip()
+        import requests
+        hosts = self._get_local_hosts()
+        last_err = None
+
+        for host in hosts:
+            # Try 1: Native Ollama API (/api/generate)
+            try:
+                resp = requests.post(
+                    f"{host}/api/generate",
+                    json={"model": model_id, "prompt": prompt, "stream": False, "options": {"temperature": 0.7, "num_predict": 800}},
+                    timeout=30
+                )
+                if resp.status_code == 200 and "response" in resp.json():
+                    return resp.json()["response"].strip()
+            except Exception as e:
+                last_err = e
+
+            # Try 2: LiteLLM / omlx / OpenAI-compatible endpoint (/v1/chat/completions)
+            try:
+                resp = requests.post(
+                    f"{host}/v1/chat/completions",
+                    json={"model": model_id, "messages": [{"role": "user", "content": prompt}], "max_tokens": 800},
+                    timeout=30
+                )
+                if resp.status_code == 200 and "choices" in resp.json():
+                    return resp.json()["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                last_err = e
+
+        # Try 3: Python ollama SDK fallback
+        try:
+            import ollama
+            client = ollama.Client(host=hosts[0])
+            r = client.generate(model=model_id, prompt=prompt, options={"temperature": 0.7, "num_predict": 800})
+            if "response" in r:
+                return r["response"].strip()
+        except Exception as e:
+            last_err = e
+
+        raise RuntimeError(f"All local Ollama/LiteLLM/omlx endpoints failed: {last_err}")
 
     def _ollama_vision(self, model_id: str, prompt: str, images_b64: List[str]) -> str:
-        import ollama
-        r = ollama.generate(
-            model=model_id,
-            prompt=prompt,
-            images=images_b64,
-            options={"temperature": 0.7, "num_predict": 800},
+        import requests
+        hosts = self._get_local_hosts()
+        last_err = None
+
+        for host in hosts:
+            try:
+                resp = requests.post(
+                    f"{host}/api/generate",
+                    json={"model": model_id, "prompt": prompt, "images": images_b64, "stream": False, "options": {"temperature": 0.7, "num_predict": 800}},
+                    timeout=30
+                )
+                if resp.status_code == 200 and "response" in resp.json():
+                    return resp.json()["response"].strip()
+            except Exception as e:
+                last_err = e
+
+        try:
+            import ollama
+            client = ollama.Client(host=hosts[0])
+            r = client.generate(model=model_id, prompt=prompt, images=images_b64, options={"temperature": 0.7, "num_predict": 800})
+            if "response" in r:
+                return r["response"].strip()
+        except Exception as e:
+            last_err = e
+
+        raise RuntimeError(f"Local Ollama vision endpoints failed: {last_err}")
+
+    def _omlx_text(self, model_id: str, prompt: str) -> str:
+        """Query local omlx MLX server on port 8000 (http://localhost:8000)."""
+        import requests
+        host = self._key("OMLX_HOST") or os.environ.get("OMLX_HOST") or "http://localhost:8000"
+        api_key = self._key("OMLX_API_KEY") or os.environ.get("OMLX_API_KEY") or ""
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        base_url = host.rstrip('/')
+
+        # Fetch active loaded model if generic
+        if model_id in ("omlx-local", "omlx", "default"):
+            try:
+                m_resp = requests.get(f"{base_url}/v1/models", headers=headers, timeout=5)
+                if m_resp.status_code == 200 and "data" in m_resp.json() and m_resp.json()["data"]:
+                    model_id = m_resp.json()["data"][0]["id"]
+            except Exception:
+                pass
+
+        url = f"{base_url}/v1/chat/completions"
+        resp = requests.post(
+            url,
+            headers=headers,
+            json={
+                "model": model_id,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 800,
+                "temperature": 0.7,
+            },
+            timeout=60,
         )
-        return r.get("response", "").strip()
+        if resp.status_code == 429:
+            raise Exception(f"429 rate limit: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
 
     # ── Public API ─────────────────────────────────────────────────────────────
+
+    def print_all_waiting_section(self, task_type: str = "text"):
+        """
+        Print cooldown state and return seconds until the earliest retry.
+
+        This function deliberately does not sleep. Callers can choose whether to
+        block, queue, or return an asynchronous retry response.
+        """
+        earliest_resume_dt = None
+        provider_status = {}
+
+        for prov in ("groq", "gemini", "openrouter", "ollama", "omlx"):
+            key_name = f"{prov.upper()}_API_KEY"
+            if prov in ("groq", "gemini", "openrouter") and not self._key(key_name):
+                provider_status[prov] = "Missing API Key"
+                continue
+            if prov == "ollama" and (
+                self._key("DISABLE_OLLAMA") == "1"
+                or os.environ.get("DISABLE_OLLAMA") == "1"
+            ):
+                provider_status[prov] = "Disabled"
+                continue
+            if prov == "omlx" and (
+                self._key("DISABLE_OMLX") == "1"
+                or os.environ.get("DISABLE_OMLX") == "1"
+            ):
+                provider_status[prov] = "Disabled"
+                continue
+
+            # Find models for this provider
+            all_models = {**MODELS_BY_KEY, **self._dynamic_models}
+            p_models = [
+                k
+                for k, m in all_models.items()
+                if m["provider"] == prov
+                and m["type"] == task_type
+                and m["model_id"] not in RETIRED_MODEL_IDS
+            ]
+            last_err = None
+            down_times = []
+            for k in p_models:
+                s = self._state.get(k, {})
+                if s.get("last_error"):
+                    last_err = s["last_error"]
+                if s.get("down_until"):
+                    try:
+                        dt = datetime.fromisoformat(s["down_until"])
+                        down_times.append(dt)
+                    except Exception:
+                        pass
+
+            if down_times:
+                p_resume = min(down_times)
+                if earliest_resume_dt is None or p_resume < earliest_resume_dt:
+                    earliest_resume_dt = p_resume
+
+                # Clean error string
+                err_desc = last_err if last_err else "Rate limited / Cooldown"
+                if len(err_desc) > 60:
+                    err_desc = err_desc[:57] + "..."
+                provider_status[prov] = f"Cooling down ({err_desc})"
+            else:
+                provider_status[prov] = (
+                    last_err if last_err else "Unavailable / not reachable"
+                )
+
+        now_dt = _utcnow()
+        if earliest_resume_dt and earliest_resume_dt > now_dt:
+            local_resume = datetime.now() + (earliest_resume_dt - now_dt)
+            resume_str = local_resume.strftime("%I:%M:%S %p")
+            wait_seconds = int((earliest_resume_dt - now_dt).total_seconds())
+        else:
+            local_resume = datetime.now() + timedelta(seconds=60)
+            resume_str = local_resume.strftime("%I:%M:%S %p")
+            wait_seconds = 60
+
+        print("\n" + "=" * 80, flush=True)
+        print("  ⏳ ALL AI PROVIDERS UNAVAILABLE OR COOLING DOWN", flush=True)
+        print("=" * 80, flush=True)
+        print(
+            f"  ⏰ Earliest retry time: {resume_str} (in {wait_seconds}s)",
+            flush=True,
+        )
+        print("\n  📋 PROVIDER ERROR & STATUS BREAKDOWN:", flush=True)
+        for prov_name, status_msg in provider_status.items():
+            print(f"   • {prov_name.capitalize():<12}: {status_msg}", flush=True)
+        print("=" * 80 + "\n", flush=True)
+        return wait_seconds
 
     def generate_text(self, prompt: str) -> str:
         """
@@ -1077,6 +1395,7 @@ class ModelRouter:
         """
         ranked = self._ranked_models("text")
         if not ranked:
+            self.print_all_waiting_section("text")
             raise RuntimeError(
                 "No text models available. Add API keys to backend/config/.api_keys"
             )
@@ -1097,6 +1416,8 @@ class ModelRouter:
                     result = self._openrouter_text(m["model_id"], prompt)
                 elif prov == "ollama":
                     result = self._ollama_text(m["model_id"], prompt)
+                elif prov == "omlx":
+                    result = self._omlx_text(m["model_id"], prompt)
                 else:
                     continue
 
@@ -1106,13 +1427,11 @@ class ModelRouter:
                 return result
 
             except Exception as e:
-                # Do not immediately abort on quota, try next model
-                # if "429" in str(e) or "quota" in str(e).lower():
-                #     raise RateLimitError("Quota limit hit")
                 status = 429 if "429" in str(e) else 0
                 self._record_failure(key, str(e), status_code=status)
                 print(f"  ✗ Failed ({type(e).__name__}), trying next …", flush=True)
 
+        self.print_all_waiting_section("text")
         raise RuntimeError("All text models failed.")
 
     def analyze_images(self, prompt: str, images_b64: List[str]) -> str:
@@ -1142,8 +1461,6 @@ class ModelRouter:
                     result = self._gemini_vision(m["model_id"], prompt, images_b64)
                 elif prov == "openrouter":
                     result = self._openrouter_vision(m["model_id"], prompt, images_b64)
-                elif prov == "ollama":
-                    result = self._ollama_vision(m["model_id"], prompt, images_b64)
                 else:
                     continue
 
@@ -1224,7 +1541,16 @@ class ModelRouter:
         parts.append("Groq ✓"        if self._key("GROQ_API_KEY")        else "Groq ✗")
         parts.append("Gemini ✓"      if self._key("GEMINI_API_KEY")      else "Gemini ✗")
         parts.append("OpenRouter ✓"  if self._key("OPENROUTER_API_KEY")  else "OpenRouter ✗")
-        parts.append("Ollama (fallback)")
+        parts.append(
+            "Ollama disabled"
+            if self._key("DISABLE_OLLAMA") == "1"
+            else "Ollama (fallback)"
+        )
+        parts.append(
+            "omlx disabled"
+            if self._key("DISABLE_OMLX") == "1"
+            else "omlx (port 8000)"
+        )
         print(f"🌐 Model Router initialised: {' | '.join(parts)}")
 
 

@@ -86,7 +86,7 @@ def get_youtube_channel_name(url: str, ai_raw: str = "") -> str:
       3. yt-dlp       — subprocess call (if yt-dlp is installed)
       4. AI output    — value parsed from Gemini's CHANNEL field in *ai_raw*
     """
-    import requests, subprocess, json as _json, shutil
+    import requests, subprocess, shutil
 
     # ── Stage 1: oEmbed (fastest, no auth) ───────────────────────────────
     try:
@@ -214,8 +214,10 @@ def _load_gemini_key() -> str:
 # Tried left-to-right; on 429 we parse the retry-after delay and honour it once.
 # Only Gemini 2.x+ models support YouTube URL as a native video part via v1beta.
 _GEMINI_MODELS = [
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-pro-preview",
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
 ]
@@ -234,32 +236,280 @@ def _parse_retry_after(err_str: str) -> float:
 
 # ── Core analysis ──────────────────────────────────────────────────────────────
 
-def analyze_youtube(youtube_url: str) -> dict:
-    """
-    Analyze a YouTube video using Gemini's native YouTube URL support.
-    Tries each model in _GEMINI_MODELS; on 429 waits the retry-after period
-    (capped at 65 s) before falling through to the next model.
+from typing import Optional, Tuple
+import tempfile
+import json
+import glob
+import subprocess
+from pathlib import Path
 
-    Returns:
-        dict with keys: raw_output (str), channel (str), thumbnail (str), error (str|None)
+
+def _cookie_args(cookies: Optional[str]) -> list[str]:
+    if not cookies:
+        return []
+    value = os.path.expanduser(cookies.strip())
+    if os.path.isfile(value):
+        return ["--cookies", value]
+    if (
+        os.path.sep in value
+        or value.endswith((".txt", ".cookies", ".json"))
+        or value.startswith(".")
+    ):
+        raise FileNotFoundError(f"Cookie file does not exist: {value}")
+    return ["--cookies-from-browser", cookies.strip()]
+
+
+def fetch_youtube_transcript(
+    youtube_url: str,
+    use_native_subtitles: bool = False,
+    transcribe_seconds: int = 0,
+    cookies: Optional[str] = None
+) -> Tuple[str, str]:
+    """
+    Fetch transcript for YouTube video.
+    Returns (transcript_text, mode_string).
+    mode_string is 'native', 'full_whisper', or '60s_whisper' (etc).
+    """
+    video_id_match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", youtube_url)
+    video_id = video_id_match.group(1) if video_id_match else "temp_sub"
+
+    # Step 1: Try native YouTube subtitles/captions (if enabled)
+    if use_native_subtitles:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_pattern = os.path.join(tmpdir, f"sub_{video_id}")
+            sub_cmd = [
+                "yt-dlp", "--write-sub", "--write-auto-sub", "--sub-lang", "en.*,en,en-US,en-GB,.*",
+                "--skip-download", "--sub-format", "json3",
+                "--extractor-args", "youtube:player_client=web,android",
+                "-o", out_pattern
+            ]
+            sub_cmd.extend(_cookie_args(cookies))
+            sub_cmd.append(youtube_url)
+
+            try:
+                proc = subprocess.run(
+                    sub_cmd, capture_output=True, text=True, timeout=60
+                )
+                sub_files = sorted(
+                    glob.glob(os.path.join(tmpdir, f"sub_{video_id}*.json3"))
+                )
+                if sub_files:
+                    sub_file = sub_files[0]
+                    for sf in sub_files:
+                        if "orig" in sf or "en." in sf or "en-" in sf:
+                            sub_file = sf
+                            break
+                    with open(sub_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    events = data.get("events", [])
+                    event_texts = []
+                    for event in events:
+                        event_text = "".join(
+                            segment.get("utf8", "")
+                            for segment in event.get("segs", [])
+                            if segment.get("utf8")
+                        ).strip()
+                        if event_text:
+                            event_texts.append(event_text)
+                    full_text = " ".join(" ".join(event_texts).split()).strip()
+                    if len(full_text.split()) > 10:
+                        word_count = len(full_text.split())
+                        print(f"  📜 [TRANSCRIPT] Used existing YouTube transcript ({word_count} words)", flush=True)
+                        return full_text, "native"
+                if proc.returncode != 0:
+                    detail = (proc.stderr or "").strip().splitlines()
+                    if detail:
+                        print(
+                            f"  ⚠️ Native transcript extraction failed: {detail[-1][:240]}",
+                            flush=True,
+                        )
+            except Exception as exc:
+                print(f"  ⚠️ Native transcript extraction failed: {exc}", flush=True)
+
+    # Step 2: Fallback to audio download + custom Whisper transcription duration
+    if transcribe_seconds and int(transcribe_seconds) > 0:
+        mode_label = f"{transcribe_seconds}s_whisper"
+        desc_label = f"first {transcribe_seconds}s of audio"
+    else:
+        mode_label = "full_whisper"
+        desc_label = "full audio"
+
+    print(f"  🎙️ [TRANSCRIPT] Transcribing {desc_label} via Groq Whisper...")
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = os.path.join(tmpdir, f"audio_{video_id}.mp3")
+            ytdlp_cmd = ["yt-dlp", "-x", "--audio-format", "mp3"]
+            if transcribe_seconds and int(transcribe_seconds) > 0:
+                ytdlp_cmd.extend(["--postprocessor-args", f"ffmpeg:-t {transcribe_seconds}"])
+            ytdlp_cmd.extend(_cookie_args(cookies))
+            ytdlp_cmd.extend(["-o", audio_path, youtube_url])
+
+            download_timeout = (
+                max(120, min(int(transcribe_seconds) + 120, 900))
+                if transcribe_seconds and int(transcribe_seconds) > 0
+                else 600
+            )
+            proc = subprocess.run(
+                ytdlp_cmd,
+                capture_output=True, text=True, timeout=download_timeout
+            )
+            if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+                from analyzers.audio_transcribe import _load_groq_key, _transcribe_groq, _transcribe_local
+                api_key = _load_groq_key()
+                text = ""
+                if api_key:
+                    try:
+                        text, _ = _transcribe_groq(Path(audio_path), api_key)
+                    except Exception:
+                        pass
+                if not text:
+                    text, _ = _transcribe_local(Path(audio_path))
+                if text:
+                    word_count = len(text.split())
+                    print(f"  🎙️ [TRANSCRIPT] Transcribed {desc_label} via Groq Whisper ({word_count} words)")
+                    return text, mode_label
+            elif proc.returncode != 0:
+                detail = (proc.stderr or "").strip().splitlines()
+                if detail:
+                    print(f"  ⚠️ Audio download failed: {detail[-1][:240]}")
+    except Exception as e:
+        print(f"  ⚠️ Audio transcription fallback error: {e}")
+
+    return "", "none"
+
+
+def _analyze_youtube_via_groq(
+    youtube_url: str,
+    use_native_subtitles: bool = False,
+    transcribe_seconds: int = 0,
+    cookies: Optional[str] = None,
+    transcript_text: Optional[str] = None,
+    transcript_mode: Optional[str] = None,
+) -> dict:
+    """Fallback: Analyze YouTube video metadata & transcript using Groq LLM via ModelRouter."""
+    print("  🌐 Groq fallback: Analyzing YouTube metadata & content...")
+    import subprocess
+    import json
+    from core.model_router import get_router
+
+    thumbnail = get_youtube_thumbnail(youtube_url)
+    post_date = get_youtube_upload_date(youtube_url)
+    channel = get_youtube_channel_name(youtube_url, ai_raw="")
+
+    title = ""
+    description = ""
+    try:
+        metadata_cmd = ["yt-dlp", "--dump-json", "--no-warnings"]
+        metadata_cmd.extend(_cookie_args(cookies))
+        metadata_cmd.append(youtube_url)
+        proc = subprocess.run(
+            metadata_cmd,
+            capture_output=True, text=True, timeout=20
+        )
+        if proc.returncode == 0 and proc.stdout:
+            data = json.loads(proc.stdout)
+            title = data.get("title", "")
+            description = data.get("description", "")
+            uploader = data.get("uploader") or data.get("channel") or channel
+            if uploader:
+                channel = uploader
+    except Exception as e:
+        print(f"  ⚠️ Could not fetch metadata via yt-dlp: {e}")
+
+    # Fetch existing native transcript or custom Whisper transcription duration
+    if transcript_text is None or transcript_mode is None:
+        transcript_text, transcript_mode = fetch_youtube_transcript(
+            youtube_url,
+            use_native_subtitles=use_native_subtitles,
+            transcribe_seconds=transcribe_seconds,
+            cookies=cookies,
+        )
+
+    prompt = (
+        f"Analyze this YouTube video based on its details and transcript:\n"
+        f"Title: {title}\n"
+        f"Channel: {channel}\n"
+        f"Description: {description[:1000]}\n"
+    )
+    if transcript_text:
+        prompt += f"Transcript ({transcript_mode}): {transcript_text[:3000]}\n\n"
+    prompt += f"\n{YOUTUBE_PROMPT}"
+
+    try:
+        router = get_router()
+        raw = router.generate_text(prompt)
+        print(f"  ✓ Groq YouTube analysis complete")
+        return {
+            "raw_output": raw,
+            "title": title,
+            "channel": channel,
+            "thumbnail": thumbnail,
+            "post_date": post_date,
+            "transcript_mode": transcript_mode,
+            "transcript_text": transcript_text,
+            "error": None
+        }
+    except Exception as e:
+        print(f"  ❌ Groq fallback failed: {e}")
+        return {
+            "raw_output": "",
+            "title": title,
+            "channel": channel,
+            "thumbnail": thumbnail,
+            "post_date": post_date,
+            "transcript_mode": transcript_mode,
+            "transcript_text": transcript_text,
+            "error": f"Groq fallback failed: {e}"
+        }
+
+
+def analyze_youtube(
+    youtube_url: str,
+    use_native_subtitles: bool = False,
+    transcribe_seconds: int = 0,
+    cookies: Optional[str] = None,
+) -> dict:
+    """
+    Analyze a YouTube video using Gemini native video support, with Groq fallback.
     """
     import time
 
+    _cookie_args(cookies)  # Validate a supplied cookie-file path before work starts.
+    transcript_text: Optional[str] = None
+    transcript_mode: Optional[str] = None
+    if use_native_subtitles or transcribe_seconds > 0:
+        transcript_text, transcript_mode = fetch_youtube_transcript(
+            youtube_url,
+            use_native_subtitles=use_native_subtitles,
+            transcribe_seconds=transcribe_seconds,
+            cookies=cookies,
+        )
+
     gemini_key = _load_gemini_key()
     if not gemini_key:
-        return {"raw_output": "", "channel": "", "thumbnail": "",
-                "error": "GEMINI_API_KEY not found. Add it to backend/.api_keys"}
+        return _analyze_youtube_via_groq(
+            youtube_url,
+            use_native_subtitles=use_native_subtitles,
+            transcribe_seconds=transcribe_seconds,
+            cookies=cookies,
+            transcript_text=transcript_text,
+            transcript_mode=transcript_mode,
+        )
 
     try:
         from google import genai
         from google.genai import types as gtypes
     except ImportError:
-        return {"raw_output": "", "channel": "", "thumbnail": "",
-                "error": "google-genai not installed. Run: pip install google-genai"}
+        return _analyze_youtube_via_groq(
+            youtube_url,
+            use_native_subtitles=use_native_subtitles,
+            transcribe_seconds=transcribe_seconds,
+            cookies=cookies,
+            transcript_text=transcript_text,
+            transcript_mode=transcript_mode,
+        )
 
     client = genai.Client(api_key=gemini_key)
-    last_error = ""
-
     for model in _GEMINI_MODELS:
         print(f"  🎬 Trying {model} for YouTube analysis...")
         try:
@@ -274,7 +524,6 @@ def analyze_youtube(youtube_url: str) -> dict:
                 ],
                 config=gtypes.GenerateContentConfig(
                     max_output_tokens=1500,
-                    temperature=0.7,
                 ),
             )
             raw = response.text.strip()
@@ -286,11 +535,13 @@ def analyze_youtube(youtube_url: str) -> dict:
             dp   = f" | date: {post_date}" if post_date else ""
             print(f"  ✓ Gemini YouTube analysis complete (model: {model}){info}{dp}")
             return {"raw_output": raw, "channel": channel, "thumbnail": thumbnail,
-                    "post_date": post_date, "error": None}
+                    "post_date": post_date,
+                    "transcript_mode": transcript_mode or "",
+                    "transcript_text": transcript_text or "",
+                    "error": None}
 
         except Exception as e:
             err = str(e)
-            last_error = err
             if "429" in err or "RESOURCE_EXHAUSTED" in err:
                 wait = min(_parse_retry_after(err), 65.0)
                 if wait > 0:
@@ -299,11 +550,18 @@ def analyze_youtube(youtube_url: str) -> dict:
                 else:
                     print(f"  ⚠️  {model} quota exhausted — trying next model")
             else:
-                # Non-quota error (e.g. 404 model not found) — try next model
+                # Non-quota error (e.g. 403 or 404) — try next model
                 print(f"  ✗ {model} failed: {err[:120]}")
 
-    print(f"  ✗ All Gemini models exhausted for YouTube analysis")
-    return {"raw_output": "", "channel": "", "thumbnail": "", "post_date": None, "error": last_error}
+    print(f"  ✗ All Gemini models exhausted. Falling back to Groq...")
+    return _analyze_youtube_via_groq(
+        youtube_url,
+        use_native_subtitles=use_native_subtitles,
+        transcribe_seconds=transcribe_seconds,
+        cookies=cookies,
+        transcript_text=transcript_text,
+        transcript_mode=transcript_mode,
+    )
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────

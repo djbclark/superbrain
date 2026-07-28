@@ -11,13 +11,13 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: superbrain-api
-    
+
     # ──── Network & Ports ────
     ports:
       - "${API_PORT:-5000}:5000"
     networks:
       - superbrain-network
-    
+
     # ──── Environment Variables ────
     environment:
       PYTHONUNBUFFERED: 1
@@ -27,30 +27,41 @@ services:
       PORT: 5000
       WORKERS: ${WORKERS:-4}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      
+
       # Database
       DATABASE_PATH: /app/data/superbrain.db
       DATABASE_TIMEOUT: 30
-      
+
       # API Keys (load from .env file)
       GROQ_API_KEY: ${GROQ_API_KEY}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
-      
+      OMLX_API_KEY: ${OMLX_API_KEY:-}
+      OMLX_HOST: ${OMLX_HOST:-http://host.docker.internal:8000}
+      DISABLE_OMLX: ${DISABLE_OMLX:-0}
+      DISABLE_OLLAMA: ${DISABLE_OLLAMA:-0}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      WEBSUB_HMAC_SECRET: ${WEBSUB_HMAC_SECRET:-}
+      WEBSUB_MAX_BODY_BYTES: ${WEBSUB_MAX_BODY_BYTES:-1048576}
+      WEBSUB_RENEW_INTERVAL_SECONDS: ${WEBSUB_RENEW_INTERVAL_SECONDS:-21600}
+      ALLOW_UNAUTHENTICATED_CONNECT_INFO: ${ALLOW_UNAUTHENTICATED_CONNECT_INFO:-0}
+      SUPERBRAIN_STATE_DIR: /app/data/state
+      SUPERBRAIN_CACHE_DIR: /app/data/cache
+
       # Instagram credentials
       INSTAGRAM_USERNAME: ${INSTAGRAM_USERNAME}
       INSTAGRAM_PASSWORD: ${INSTAGRAM_PASSWORD}
-      
+
       # AI Configuration
       WHISPER_MODEL: ${WHISPER_MODEL:-base}
       WHISPER_USE_CLOUD: ${WHISPER_USE_CLOUD:-true}
-      
+
       # Performance
       MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-52428800}
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-60}
       ANALYSIS_TIMEOUT: ${ANALYSIS_TIMEOUT:-120}
-    
+
     # ──── Volumes ────
     volumes:
       # Database persistence
@@ -65,10 +76,10 @@ services:
       - superbrain-thumbnails:/app/static/thumbnails
       # Logs
       - superbrain-logs:/app/logs
-    
+
     # ──── Restart Policy ────
     restart: unless-stopped
-    
+
     # ──── Health Check ────
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
@@ -76,7 +87,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-    
+
     # ──── Resource Limits (optional, enable for production) ────
     # uncomment to enable
     # deploy:
@@ -87,7 +98,7 @@ services:
     #     reservations:
     #       cpus: '1'
     #       memory: 1G
-    
+
     # ──── Security Options ────
     security_opt:
       - no-new-privileges:true

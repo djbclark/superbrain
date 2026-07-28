@@ -8,33 +8,111 @@ Self-hosted, zero-config, file-based database
 import sqlite3
 import json
 import os
+import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 # Database file path can be overridden for Docker deployments
 DB_PATH = Path(os.getenv("DATABASE_PATH", str(Path(__file__).resolve().parent.parent / 'superbrain.db')))
 
 
-class Database:
-    """SQLite database manager with caching functionality"""
+def _utcnow():
+    """Return naive UTC for compatibility with existing timestamp strings."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
-    def __init__(self):
-        self.db_path = DB_PATH
-        self._conn = None
+
+class Database:
+    """SQLite database manager with one WAL connection per calling thread."""
+
+    def __init__(self, db_path=None, initialize_schema=True):
+        self.db_path = Path(db_path) if db_path is not None else DB_PATH
+        self._local = threading.local()
+        self._schema_lock = threading.RLock()
+        self._connection_lock = threading.Lock()
+        self._connections = set()
         self._connect()
+        if initialize_schema:
+            with self._schema_lock:
+                self._create_tables()
+        print(f"[OK] Connected to SQLite database: {self.db_path}")
 
     def _connect(self):
+        """Create and register the current thread's SQLite connection."""
+        conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=float(os.getenv("DATABASE_TIMEOUT", "30")),
+            # Connections are still isolated per thread. Disabling SQLite's
+            # ownership check only lets close() release worker connections
+            # after a ThreadPoolExecutor has shut down.
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={int(float(os.getenv('DATABASE_TIMEOUT', '30')) * 1000)}")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        self._local.conn = conn
+        with self._connection_lock:
+            self._connections.add(conn)
+        return conn
+
+    @property
+    def _conn(self):
+        """Compatibility accessor returning the connection for this thread."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._connect()
+        return conn
+
+    def close_thread_connection(self):
+        """Close only the calling thread's connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
         try:
-            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            # WAL mode for better concurrent read performance
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            self._create_tables()
-            print(f"[OK] Connected to SQLite database: {self.db_path}")
-        except Exception as e:
-            print(f"[WARNING] SQLite connection failed: {e}")
-            self._conn = None
+            conn.close()
+        finally:
+            with self._connection_lock:
+                self._connections.discard(conn)
+            self._local.conn = None
+
+    def close(self):
+        """Close every connection created by this Database instance."""
+        with self._connection_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for conn in connections:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._local.conn = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close_thread_connection()
+
+    def _has_column(self, table, column):
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(row["name"] == column for row in rows)
+
+    def _add_column_if_missing(self, table, column, declaration):
+        if self._has_column(table, column):
+            return
+        try:
+            self._conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            # Another Uvicorn process may have completed the same additive
+            # migration after our initial PRAGMA check. Suppress only that
+            # confirmed race; every other migration error must fail startup.
+            self._conn.rollback()
+            if not self._has_column(table, column):
+                raise
 
     def _create_tables(self):
         self._conn.executescript("""
@@ -55,6 +133,7 @@ class Database:
                 category            TEXT,
                 visual_analysis     TEXT,
                 audio_transcription TEXT,
+                transcript_mode     TEXT DEFAULT '',
                 text_analysis       TEXT
             );
 
@@ -68,6 +147,20 @@ class Database:
                 updated_at  TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS websub_subscriptions (
+                channel_id    TEXT PRIMARY KEY,
+                channel_title TEXT DEFAULT '',
+                callback_url  TEXT,
+                topic_url     TEXT,
+                subscribed_at TEXT,
+                lease_seconds INTEGER DEFAULT 864000,
+                lease_expires_at TEXT,
+                verified_at   TEXT,
+                pending_mode  TEXT DEFAULT 'subscribe',
+                last_error    TEXT DEFAULT '',
+                status        TEXT DEFAULT 'pending'
+            );
+
             CREATE INDEX IF NOT EXISTS idx_analyses_category    ON analyses (category);
             CREATE INDEX IF NOT EXISTS idx_analyses_analyzed_at ON analyses (analyzed_at DESC);
             CREATE INDEX IF NOT EXISTS idx_queue_status         ON processing_queue (status);
@@ -75,19 +168,16 @@ class Database:
         """)
         self._conn.commit()
 
-        # Migration: add content_type to databases that predate this column
-        try:
-            self._conn.execute("ALTER TABLE analyses ADD COLUMN content_type TEXT DEFAULT 'instagram'")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass  # Column already exists – expected on most runs
-
-        # Migration: add thumbnail column
-        try:
-            self._conn.execute("ALTER TABLE analyses ADD COLUMN thumbnail TEXT DEFAULT ''")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
+        # Additive migrations for databases created by earlier releases.
+        self._add_column_if_missing(
+            "analyses", "content_type", "TEXT DEFAULT 'instagram'"
+        )
+        self._add_column_if_missing(
+            "analyses", "thumbnail", "TEXT DEFAULT ''"
+        )
+        self._add_column_if_missing(
+            "analyses", "transcript_mode", "TEXT DEFAULT ''"
+        )
 
         # Migration: add retry columns to processing_queue
         for _col, _dflt in [
@@ -96,37 +186,33 @@ class Database:
             ("reason",       "TEXT"),
             ("content_type", "TEXT"),
         ]:
-            try:
-                self._conn.execute(
-                    f"ALTER TABLE processing_queue ADD COLUMN {_col} {_dflt}"
-                )
-                self._conn.commit()
-            except sqlite3.OperationalError:
-                pass  # already exists
+            self._add_column_if_missing("processing_queue", _col, _dflt)
 
-        try:
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_queue_retry ON processing_queue (status, retry_after)"
-            )
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_queue_retry "
+            "ON processing_queue (status, retry_after)"
+        )
+        self._conn.commit()
 
         # Create content_type index only after the column is guaranteed to exist
-        try:
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_analyses_content_type ON analyses (content_type)"
-            )
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_analyses_content_type "
+            "ON analyses (content_type)"
+        )
+        self._conn.commit()
 
-        # Migration: add is_hidden for soft-delete support
-        try:
-            self._conn.execute("ALTER TABLE analyses ADD COLUMN is_hidden INTEGER DEFAULT 0")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
+        self._add_column_if_missing(
+            "analyses", "is_hidden", "INTEGER DEFAULT 0"
+        )
+
+        for _col, _dflt in [
+            ("topic_url", "TEXT"),
+            ("lease_expires_at", "TEXT"),
+            ("verified_at", "TEXT"),
+            ("pending_mode", "TEXT DEFAULT 'subscribe'"),
+            ("last_error", "TEXT DEFAULT ''"),
+        ]:
+            self._add_column_if_missing("websub_subscriptions", _col, _dflt)
 
         # Collections table
         self._conn.executescript("""
@@ -144,7 +230,7 @@ class Database:
         cur = self._conn.cursor()
         cur.execute("SELECT id FROM collections WHERE id = 'default_watch_later'")
         if cur.fetchone() is None:
-            now = datetime.utcnow().isoformat()
+            now = _utcnow().isoformat()
             self._conn.execute(
                 "INSERT INTO collections (id, name, icon, post_ids, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 ('default_watch_later', 'Watch Later', 'time', '[]', now, now)
@@ -193,13 +279,17 @@ class Database:
         else:
             d['tags'] = []
         return d
-    
+
     # ------------------------------------------------------------------
     # Connection
     # ------------------------------------------------------------------
 
     def is_connected(self):
-        return self._conn is not None
+        try:
+            self._conn.execute("SELECT 1")
+            return True
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Cache / Analyses
@@ -217,24 +307,29 @@ class Database:
             print(f"[WARNING]  Cache lookup error: {e}")
             return None
 
+    def get_by_shortcode(self, shortcode):
+        """Return cached analysis dict or None by shortcode."""
+        return self.check_cache(shortcode)
+
     def save_analysis(self, shortcode, url, username, title, summary, tags, music, category,
                       visual_analysis="", audio_transcription="", text_analysis="",
-                      likes=0, post_date=None, content_type="instagram", thumbnail=""):
+                      likes=0, post_date=None, content_type="instagram", thumbnail="",
+                      transcript_mode=""):
         """Insert or update an analysis record. Returns True on success."""
         if not self.is_connected():
             print("[WARNING] Database not connected. Analysis not saved.")
             return False
         try:
             print(f"📝 Saving to database with shortcode: {shortcode}")
-            now = datetime.utcnow().isoformat()
+            now = _utcnow().isoformat()
             tags_json = json.dumps(tags if isinstance(tags, list) else tags.split())
 
             self._conn.execute("""
                 INSERT INTO analyses
                     (shortcode, url, username, content_type, analyzed_at, updated_at, post_date, likes,
                      thumbnail, title, summary, tags, music, category,
-                     visual_analysis, audio_transcription, text_analysis)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     visual_analysis, audio_transcription, transcript_mode, text_analysis)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(shortcode) DO UPDATE SET
                     url                 = excluded.url,
                     username            = excluded.username,
@@ -250,19 +345,24 @@ class Database:
                     category            = excluded.category,
                     visual_analysis     = excluded.visual_analysis,
                     audio_transcription = excluded.audio_transcription,
+                    transcript_mode     = excluded.transcript_mode,
                     text_analysis       = excluded.text_analysis
             """, (shortcode, url, username, content_type, now, now, post_date, likes,
                   thumbnail, title, summary, tags_json, music, category,
-                  visual_analysis, audio_transcription, text_analysis))
+                  visual_analysis, audio_transcription, transcript_mode, text_analysis))
             self._conn.commit()
             print(f"[OK] Analysis saved to database ({shortcode})")
             return True
         except Exception as e:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
             print(f"[WARNING]  Error saving to database: {e}")
             import traceback
             traceback.print_exc()
             return False
-    
+
     def get_recent(self, limit=10):
         """Return the most recently analysed posts (excludes soft-deleted)."""
         if not self.is_connected():
@@ -294,7 +394,7 @@ class Database:
             print(f"[WARNING]  Error retrieving recent (light): {e}")
             return []
 
-    def get_posts_since(self, updated_after: str, limit=1000):
+    def get_posts_since(self, updated_after: str, limit=1000, offset=0):
         """Return posts updated after the given ISO timestamp (delta sync).
         Includes soft-deleted posts so the app knows to hide them."""
         if not self.is_connected():
@@ -304,8 +404,8 @@ class Database:
             cur.execute(
                 f"SELECT {self.LIGHT_COLUMNS} FROM analyses "
                 "WHERE updated_at > ? "
-                "ORDER BY updated_at ASC LIMIT ?",
-                (updated_after, limit)
+                "ORDER BY updated_at ASC LIMIT ? OFFSET ?",
+                (updated_after, limit, offset)
             )
             return [self._row_to_dict(r) for r in cur.fetchall()]
         except Exception as e:
@@ -455,11 +555,6 @@ class Database:
             print(f"[WARNING]  Error getting collections for export: {e}")
             return []
 
-    def close(self):
-        if self._conn:
-            self._conn.close()
-            self._conn = None
-    
     # ==================== RETRY QUEUE ====================
 
     def queue_for_retry(self, shortcode: str, url: str, content_type: str,
@@ -472,8 +567,7 @@ class Database:
         if not self.is_connected():
             return False
         try:
-            from datetime import timezone, timedelta
-            now      = datetime.utcnow()
+            now      = _utcnow()
             retry_at = (now + timedelta(hours=retry_hours)).isoformat()
             now_str  = now.isoformat()
 
@@ -512,7 +606,7 @@ class Database:
         if not self.is_connected():
             return []
         try:
-            now = datetime.utcnow().isoformat()
+            now = _utcnow().isoformat()
             cur = self._conn.cursor()
             cur.execute("""
                 SELECT shortcode, url, content_type, reason, attempts, retry_after
@@ -577,7 +671,7 @@ class Database:
             row = cur.fetchone()
             position = (row[0] + 1) if row[0] is not None else 1
 
-            now = datetime.utcnow().isoformat()
+            now = _utcnow().isoformat()
             self._conn.execute("""
                 INSERT INTO processing_queue (shortcode, url, status, position, added_at, updated_at)
                 VALUES (?, ?, 'queued', ?, ?, ?)
@@ -611,6 +705,48 @@ class Database:
             print(f"[WARNING]  Error getting queue: {e}")
             return []
 
+    def claim_next_queue_item(self, max_concurrent=1):
+        """Atomically claim the next queued item across threads/processes."""
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            processing_count = conn.execute(
+                "SELECT COUNT(*) FROM processing_queue WHERE status = 'processing'"
+            ).fetchone()[0]
+            if processing_count >= max_concurrent:
+                conn.commit()
+                return None
+            row = conn.execute(
+                """
+                SELECT shortcode, url, position
+                FROM processing_queue
+                WHERE status = 'queued'
+                ORDER BY position
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            now = _utcnow().isoformat()
+            updated = conn.execute(
+                """
+                UPDATE processing_queue
+                SET status = 'processing', started_at = ?, updated_at = ?
+                WHERE shortcode = ? AND status = 'queued'
+                """,
+                (now, now, row["shortcode"]),
+            )
+            conn.commit()
+            return dict(row) if updated.rowcount == 1 else None
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            print(f"[WARNING]  Error claiming queue item: {e}")
+            return None
+
     def get_processing(self):
         """Return list of shortcodes currently being processed."""
         if not self.is_connected():
@@ -630,7 +766,7 @@ class Database:
         if not self.is_connected():
             return False
         try:
-            now = datetime.utcnow().isoformat()
+            now = _utcnow().isoformat()
             self._conn.execute("""
                 UPDATE processing_queue
                 SET status = 'processing', started_at = ?, updated_at = ?
@@ -668,21 +804,28 @@ class Database:
             print(f"[WARNING]  Error removing from queue: {e}")
             return False
 
-    def recover_interrupted_items(self):
+    def recover_interrupted_items(self, stale_after_seconds=900):
         """
-        Move items stuck in 'processing' back to 'queued' (e.g. after a crash).
+        Move stale processing items back to queued after a worker crash.
+
+        A fresh processing row is left alone so another Uvicorn worker or a
+        rolling restart cannot duplicate an analysis that is still running.
         Returns the number of items recovered.
         """
         if not self.is_connected():
             return 0
         try:
-            now = datetime.utcnow().isoformat()
+            now = _utcnow().isoformat()
+            cutoff = (
+                _utcnow() - timedelta(seconds=max(1, int(stale_after_seconds)))
+            ).isoformat()
             cur = self._conn.cursor()
             cur.execute("""
                 UPDATE processing_queue
-                SET status = 'queued', updated_at = ?
+                SET status = 'queued', started_at = NULL, updated_at = ?
                 WHERE status = 'processing'
-            """, (now,))
+                  AND (started_at IS NULL OR started_at <= ?)
+            """, (now, cutoff))
             count = cur.rowcount
             self._conn.commit()
 
@@ -703,7 +846,7 @@ class Database:
         except Exception as e:
             print(f"[WARNING]  Error recovering items: {e}")
             return 0
-    
+
     # ------------------------------------------------------------------
     # Post management
     # ------------------------------------------------------------------
@@ -713,7 +856,7 @@ class Database:
         if not self.is_connected():
             return False
         try:
-            now = datetime.utcnow().isoformat()
+            now = _utcnow().isoformat()
             cur = self._conn.execute(
                 "UPDATE analyses SET is_hidden = 1, updated_at = ? WHERE shortcode = ?",
                 (now, shortcode)
@@ -752,7 +895,7 @@ class Database:
         try:
             cur = self._conn.execute(
                 "UPDATE analyses SET is_hidden = 0, updated_at = ? WHERE shortcode = ?",
-                (datetime.utcnow().isoformat(), shortcode)
+                (_utcnow().isoformat(), shortcode)
             )
             self._conn.commit()
             return cur.rowcount > 0
@@ -774,7 +917,7 @@ class Database:
         if not self.is_connected():
             return False
         try:
-            updates["updated_at"] = datetime.utcnow().isoformat()
+            updates["updated_at"] = _utcnow().isoformat()
             set_clause = ", ".join(f"{k} = ?" for k in updates)
             values = list(updates.values()) + [shortcode]
             cur = self._conn.execute(
@@ -833,7 +976,7 @@ class Database:
         if not self.is_connected():
             return None
         try:
-            now = datetime.utcnow().isoformat()
+            now = _utcnow().isoformat()
             self._conn.execute("""
                 INSERT INTO collections (id, name, icon, post_ids, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -858,7 +1001,7 @@ class Database:
         if not self.is_connected():
             return False
         try:
-            now = datetime.utcnow().isoformat()
+            now = _utcnow().isoformat()
             cur = self._conn.execute(
                 "UPDATE collections SET post_ids = ?, updated_at = ? WHERE id = ?",
                 (json.dumps(post_ids), now, collection_id)
@@ -881,17 +1024,168 @@ class Database:
             print(f"[WARNING]  Error deleting collection: {e}")
             return False
 
+    # ------------------------------------------------------------------
+    # YouTube WebSub subscriptions
+    # ------------------------------------------------------------------
+
+    def upsert_websub_subscription(
+        self,
+        channel_id,
+        callback_url,
+        topic_url,
+        channel_title="",
+        lease_seconds=864000,
+        status="pending",
+        pending_mode="subscribe",
+        last_error="",
+    ):
+        """Create or update WebSub state without treating HTTP 202 as verified."""
+        now = _utcnow().isoformat()
+        self._conn.execute(
+            """
+            INSERT INTO websub_subscriptions
+                (channel_id, channel_title, callback_url, topic_url,
+                 subscribed_at, lease_seconds, pending_mode, last_error, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                channel_title = excluded.channel_title,
+                callback_url = excluded.callback_url,
+                topic_url = excluded.topic_url,
+                subscribed_at = excluded.subscribed_at,
+                lease_seconds = excluded.lease_seconds,
+                pending_mode = excluded.pending_mode,
+                last_error = excluded.last_error,
+                status = CASE
+                    WHEN websub_subscriptions.status = 'active'
+                         AND excluded.status = 'pending'
+                    THEN 'active'
+                    ELSE excluded.status
+                END
+            """,
+            (
+                channel_id,
+                channel_title,
+                callback_url,
+                topic_url,
+                now,
+                int(lease_seconds),
+                pending_mode,
+                last_error,
+                status,
+            ),
+        )
+        self._conn.commit()
+
+    def get_websub_subscription_by_topic(self, topic_url):
+        row = self._conn.execute(
+            "SELECT * FROM websub_subscriptions WHERE topic_url = ?",
+            (topic_url,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_websub_subscription(self, channel_id):
+        row = self._conn.execute(
+            "SELECT * FROM websub_subscriptions WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def mark_websub_verified(self, topic_url, mode, lease_seconds=None):
+        """Apply a verified subscribe/unsubscribe intent challenge."""
+        if mode == "unsubscribe":
+            cur = self._conn.execute(
+                """
+                UPDATE websub_subscriptions
+                SET status = 'inactive', pending_mode = NULL,
+                    lease_expires_at = NULL, verified_at = ?
+                WHERE topic_url = ? AND pending_mode = 'unsubscribe'
+                """,
+                (_utcnow().isoformat(), topic_url),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+        lease = int(lease_seconds or 864000)
+        now = _utcnow()
+        cur = self._conn.execute(
+            """
+            UPDATE websub_subscriptions
+            SET status = 'active', pending_mode = NULL, last_error = '',
+                lease_seconds = ?, verified_at = ?, lease_expires_at = ?
+            WHERE topic_url = ? AND pending_mode = 'subscribe'
+            """,
+            (
+                lease,
+                now.isoformat(),
+                (now + timedelta(seconds=lease)).isoformat(),
+                topic_url,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def mark_websub_failed(self, channel_id, error):
+        self._conn.execute(
+            """
+            UPDATE websub_subscriptions
+            SET status = CASE
+                    WHEN status = 'active' THEN 'active'
+                    ELSE 'failed'
+                END,
+                pending_mode = CASE
+                    WHEN status = 'active' THEN NULL
+                    ELSE pending_mode
+                END,
+                last_error = ?
+            WHERE channel_id = ?
+            """,
+            (str(error)[:500], channel_id),
+        )
+        self._conn.commit()
+
+    def list_websub_subscriptions(self, status=None):
+        if status:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM websub_subscriptions
+                WHERE status = ?
+                ORDER BY subscribed_at DESC
+                """,
+                (status,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM websub_subscriptions ORDER BY subscribed_at DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_websub_renewal_candidates(self, within_hours=48):
+        cutoff = (_utcnow() + timedelta(hours=within_hours)).isoformat()
+        rows = self._conn.execute(
+            """
+            SELECT * FROM websub_subscriptions
+            WHERE status = 'active'
+              AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+            ORDER BY lease_expires_at
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
 
 # ------------------------------------------------------------------
 # Singleton accessor
 # ------------------------------------------------------------------
 
 _db_instance = None
+_db_instance_lock = threading.Lock()
 
 
 def get_db():
     """Get or create the shared Database instance."""
     global _db_instance
     if _db_instance is None:
-        _db_instance = Database()
+        with _db_instance_lock:
+            if _db_instance is None:
+                _db_instance = Database()
     return _db_instance

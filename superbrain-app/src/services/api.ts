@@ -305,18 +305,28 @@ class ApiService {
   /**
    * Delta sync — returns posts modified after the given ISO timestamp.
    */
-  async syncPosts(since: string): Promise<Post[]> {
+  async syncPosts(
+    since: string,
+    limit: number = 200,
+    offset: number = 0,
+  ): Promise<{ data: Post[]; hasMore: boolean }> {
     try {
       const headers = await this.getHeaders();
       const baseUrl = await this.getBaseUrl();
-      const response = await axios.get<{ success: boolean; data: Post[] }>(
-        `${baseUrl}/sync?since=${encodeURIComponent(since)}&limit=1000`,
+      const response = await axios.get<{
+        success: boolean; data: Post[]; has_more?: boolean
+      }>(
+        `${baseUrl}/sync?since=${encodeURIComponent(since)}&limit=${limit}&offset=${offset}`,
         { headers, timeout: 30000 }
       );
-      return (response.data.data || []).map(normalizePost);
+      const data = (response.data.data || []).map(normalizePost);
+      return {
+        data,
+        hasMore: response.data.has_more ?? data.length === limit,
+      };
     } catch (error: any) {
       console.error('Error syncing posts:', error.response?.data?.detail || error.message);
-      return [];
+      return { data: [], hasMore: false };
     }
   }
 
@@ -756,4 +766,3 @@ class ApiService {
 }
 
 export default new ApiService();
-

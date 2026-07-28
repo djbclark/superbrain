@@ -56,8 +56,16 @@ async function deltaSync(): Promise<number> {
     return fullSync();
   }
 
-  // Fetch changed posts
-  const changedPosts = await apiService.syncPosts(since);
+  // Fetch every changed row before advancing the cursor. A single delta can
+  // exceed the server's page size after a large playlist import.
+  const changedPosts: Post[] = [];
+  let offset = 0;
+  while (true) {
+    const page = await apiService.syncPosts(since, BATCH_SIZE, offset);
+    changedPosts.push(...page.data);
+    offset += page.data.length;
+    if (!page.hasMore || page.data.length === 0) break;
+  }
 
   // Filter out hidden (soft-deleted) posts for upsert; delete them locally instead
   const toUpsert: Post[] = [];

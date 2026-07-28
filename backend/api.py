@@ -7,9 +7,9 @@ With request queuing, live progress logging, and API key authentication
 
 from fastapi import FastAPI, HTTPException, Query, Header, Depends, Request, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
-from pydantic import BaseModel, HttpUrl
-from typing import Optional, List, Dict, Any
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel
+from typing import Optional, List
 import subprocess
 import asyncio
 import sys
@@ -17,13 +17,17 @@ import os
 import json
 import zipfile
 import io
+import hashlib
 from datetime import datetime
 import logging
 import secrets
 import string
 import threading
 import time
+import tempfile
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Import database module
 from core.database import get_db
@@ -54,9 +58,7 @@ def load_or_create_api_token():
     if TOKEN_FILE.exists():
         content = TOKEN_FILE.read_text(encoding="utf-8", errors="ignore").strip()
         if content and is_valid_api_token_format(content):
-            logger.info("=" * 80)
-            logger.info(f"🔐 API Token: {content}")
-            logger.info("=" * 80)
+            logger.info("🔐 Loaded API access token from token.txt")
             return content
 
         if content:
@@ -65,9 +67,7 @@ def load_or_create_api_token():
     token = generate_api_token()
     TOKEN_FILE.write_text(token)
 
-    logger.info("=" * 80)
-    logger.info(f"🔐 API Token (NEW): {token}")
-    logger.info("=" * 80)
+    logger.info("🔐 Generated a new API access token in token.txt")
     return token
 
 API_TOKEN = load_or_create_api_token()
@@ -78,7 +78,7 @@ async def verify_token(request: Request, x_api_key: str = Header(None, descripti
     Can be passed in X-API-Key header or token query parameter.
     """
     actual_token = x_api_key or request.query_params.get("token")
-    if actual_token != API_TOKEN:
+    if not secrets.compare_digest(actual_token or "", API_TOKEN):
         logger.warning("Invalid Access Token attempt from IP: %s", request.client.host if hasattr(request, 'client') and request.client else 'unknown')
         raise HTTPException(
             status_code=401,
@@ -86,11 +86,29 @@ async def verify_token(request: Request, x_api_key: str = Header(None, descripti
         )
     return actual_token
 
+@asynccontextmanager
+async def app_lifespan(application: FastAPI):
+    """Run one non-blocking WebSub renewal leader across Uvicorn workers."""
+    lock_file = _try_acquire_websub_leader_lock()
+    renewal_task = None
+    if lock_file is not None:
+        renewal_task = asyncio.create_task(_websub_renewal_loop())
+    try:
+        yield
+    finally:
+        if renewal_task is not None:
+            renewal_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await renewal_task
+        _release_websub_leader_lock(lock_file)
+
+
 # Initialize FastAPI app
 app = FastAPI(
     title="SuperBrain",
     description="AI-powered Instagram content analysis with caching",
-    version="1.02"
+    version="1.02",
+    lifespan=app_lifespan,
 )
 
 # CORS configuration
@@ -180,13 +198,18 @@ def queue_worker():
     """Background thread that processes queued items automatically"""
     logger.info("🔧 Queue worker thread started")
     _retry_check_counter = 0
-    
+
     while True:
         try:
             # ── Periodic retry-queue drain (every ~2.5 min) ─────────────────
             _retry_check_counter += 1
             if _retry_check_counter >= 30:
                 _retry_check_counter = 0
+                recovered = db.recover_interrupted_items()
+                if recovered:
+                    logger.info(
+                        "🔄 Recovered %d stale processing item(s)", recovered
+                    )
                 ready = db.get_retry_ready()
                 if ready:
                     logger.info(f"🔄 Promoting {len(ready)} retry-ready item(s) back to queue")
@@ -197,76 +220,81 @@ def queue_worker():
                         )
                         db.add_to_queue(r_item['shortcode'], r_item['url'])
 
-            # Check if we have capacity
-            processing = db.get_processing()
-            if len(processing) < max_concurrent:
-                # Get next item from queue
+            item = db.claim_next_queue_item(max_concurrent=max_concurrent)
+            if item:
                 queue = db.get_queue()
-                if queue:
-                    item = queue[0]  # Get first item
-                    shortcode = item['shortcode']
-                    url = item['url']
-                    
-                    logger.info(f"📋 Queue alert: Processing next in queue")
-                    logger.info(f"📊 Queue status: {len(queue) - 1} remaining after this | Starting: {shortcode}")
-                    logger.info(f"📤 [{shortcode}] Starting analysis from queue...")
-                    
-                    # Mark as processing
-                    db.mark_processing(shortcode)
-                    
-                    # Run analysis
+                shortcode = item['shortcode']
+                url = item['url']
+
+                logger.info("📋 Queue alert: Processing next in queue")
+                logger.info(
+                    f"📊 Queue status: {len(queue)} remaining after this | "
+                    f"Starting: {shortcode}"
+                )
+                logger.info(f"📤 [{shortcode}] Starting analysis from queue...")
+
+                # Run analysis
+                try:
+                    process = subprocess.Popen(
+                        [sys.executable, "main.py", url],
+                        cwd=Path(__file__).parent,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        bufsize=1
+                    )
+
+                    # Register so delete_post can kill it
+                    with _active_processes_lock:
+                        _active_processes[shortcode] = process
+
+                    # Wait for completion
                     try:
-                        process = subprocess.Popen(
-                            [sys.executable, "main.py", url],
-                            cwd=Path(__file__).parent,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            encoding="utf-8",
-                            bufsize=1
+                        process.wait(timeout=600)
+                    except subprocess.TimeoutExpired:
+                        logger.error(
+                            f"❌ [{shortcode}] Process timed out after 10 minutes. "
+                            "Killing..."
                         )
-
-                        # Register so delete_post can kill it
-                        with _active_processes_lock:
-                            _active_processes[shortcode] = process
-
-                        # Wait for completion
-                        try:
-                            process.wait(timeout=600)
-                        except subprocess.TimeoutExpired:
-                            logger.error(f"❌ [{shortcode}] Process timed out after 10 minutes. Killing...")
-                            process.kill()
-                            process.wait()
-                            db.remove_from_queue(shortcode)
-                            continue
-
-                        with _active_processes_lock:
-                            _active_processes.pop(shortcode, None)
-
-                        # If the post was deleted while processing, skip queue cleanup
-                        # (delete_post already called remove_from_queue)
-                        if process.returncode == -9 or process.returncode == -15:
-                            logger.info(f"🛑 [{shortcode}] Analysis killed (post was deleted)")
-                        elif process.returncode == 0:
-                            logger.info(f"✅ Queue item completed: {shortcode}")
-                            db.remove_from_queue(shortcode)
-                        elif process.returncode == 2:
-                            # main.py queued this item for retry — status already set in DB
-                            logger.info(f"⏰ [{shortcode}] Quota exhausted — moved to retry queue")
-                            db.remove_from_queue(shortcode)
-                        else:
-                            logger.error(f"❌ Queue item failed (rc={process.returncode}): {shortcode}")
-                            db.remove_from_queue(shortcode)
-
-                    except Exception as e:
-                        with _active_processes_lock:
-                            _active_processes.pop(shortcode, None)
-                        logger.error(f"❌ Error processing queue item {shortcode}: {e}")
+                        process.kill()
+                        process.wait()
                         db.remove_from_queue(shortcode)
-            
+                        continue
+
+                    with _active_processes_lock:
+                        _active_processes.pop(shortcode, None)
+
+                    # If the post was deleted while processing, skip queue cleanup
+                    # (delete_post already called remove_from_queue)
+                    if process.returncode in (-9, -15):
+                        logger.info(
+                            f"🛑 [{shortcode}] Analysis killed (post was deleted)"
+                        )
+                    elif process.returncode == 0:
+                        logger.info(f"✅ Queue item completed: {shortcode}")
+                        db.remove_from_queue(shortcode)
+                    elif process.returncode == 2:
+                        # main.py queued this item for retry; status is already in DB.
+                        logger.info(
+                            f"⏰ [{shortcode}] Quota exhausted — moved to retry queue"
+                        )
+                    else:
+                        logger.error(
+                            f"❌ Queue item failed (rc={process.returncode}): "
+                            f"{shortcode}"
+                        )
+                        db.remove_from_queue(shortcode)
+
+                except Exception as e:
+                    with _active_processes_lock:
+                        _active_processes.pop(shortcode, None)
+                    logger.error(f"❌ Error processing queue item {shortcode}: {e}")
+                    db.remove_from_queue(shortcode)
+
             # Sleep before next check
             time.sleep(5)
-            
+
         except Exception as e:
             logger.error(f"Queue worker error: {e}")
             time.sleep(10)
@@ -280,12 +308,16 @@ logger.info("✅ Background queue worker initialized")
 class AnalyzeRequest(BaseModel):
     url: str
     force: bool = False
+    use_youtube_transcripts: bool = False
+    transcribe_seconds: int = 0
 
     class Config:
         json_schema_extra = {
             "example": {
-                "url": "https://www.instagram.com/p/DRWKk5JiL0h/",
-                "force": False
+                "url": "https://www.youtube.com/watch?v=Mqr2wO_Vap8",
+                "force": False,
+                "use_youtube_transcripts": False,
+                "transcribe_seconds": 0
             }
         }
 
@@ -302,12 +334,12 @@ class AnalysisResponse(BaseModel):
 @app.get("/")
 async def root():
     """API information and health check (no authentication required)"""
-    
+
     backend_id = "unknown"
     backend_id_path = get_config_path("backend_id.txt")
     if backend_id_path.exists():
         backend_id = backend_id_path.read_text().strip()
-    
+
     return {
         "backendId": backend_id,
 
@@ -336,22 +368,22 @@ async def get_caption(url: str, token: str = Depends(verify_token)):
     """
     try:
         logger.info(f"🔍 Quick caption fetch for: {url}")
-        
+
         # Extract shortcode for logging
         validation = validate_link(url)
         shortcode = validation['shortcode']
-        
+
         # Run caption.py as subprocess - simple and reliable
         import subprocess
         import sys
-        
+
         loop = asyncio.get_event_loop()
-        
+
         def run_caption_script():
             # Use the same Python interpreter as the API (with all packages)
             python_exe = sys.executable
             print(f"[API] Using Python: {python_exe}")
-            
+
             result = subprocess.run(
                 [python_exe, 'analyzers/caption.py', url],
                 capture_output=True,
@@ -365,7 +397,7 @@ async def get_caption(url: str, token: str = Depends(verify_token)):
             print(f"[API] Subprocess stderr: {repr(result.stderr[:200])}")
             print(f"[API] Subprocess returncode: {result.returncode}")
             return result.stdout.strip() if result.stdout else ""
-        
+
         try:
             caption_text = await asyncio.wait_for(
                 loop.run_in_executor(None, run_caption_script),
@@ -380,9 +412,9 @@ async def get_caption(url: str, token: str = Depends(verify_token)):
                 "title": "Instagram Post",
                 "full_caption": ""
             }
-        
+
         print(f"[API] Final caption_text: {repr(caption_text)}")
-        
+
         # Check if it's an error message
         if caption_text.startswith('❌') or caption_text.startswith('ℹ️'):
             logger.warning(f"⚠️ [{shortcode}] {caption_text}")
@@ -393,13 +425,13 @@ async def get_caption(url: str, token: str = Depends(verify_token)):
                 "title": "Instagram Post",
                 "full_caption": ""
             }
-        
+
         # Limit to 100 chars for title
         title = caption_text[:100] if len(caption_text) > 100 else caption_text
         title = title if title else "Instagram Post"
-        
+
         logger.info(f"✅ [{shortcode}] Caption: {title}")
-        
+
         return {
             "success": True,
             "shortcode": shortcode,
@@ -407,7 +439,7 @@ async def get_caption(url: str, token: str = Depends(verify_token)):
             "title": title,
             "full_caption": caption_text
         }
-        
+
     except Exception as e:
         logger.error(f"❌ Caption fetch failed: {str(e)}", exc_info=True)
         return {
@@ -444,17 +476,17 @@ async def analyze_instagram(request: AnalyzeRequest, token: str = Depends(verify
         url_str = validation['url']
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid URL: {str(e)}")
-    
+
     logger.info(f"📥 New request: {shortcode}")
-    
+
     # Initialize database connection
     db = get_db()
-    
+
     try:
         # Step 1: Check database cache first
         logger.info(f"🔍 [{shortcode}] Checking database cache...")
         cached_result = db.check_cache(shortcode)
-        
+
         if cached_result:
             # Force re-analyze: hard-delete existing record and proceed with fresh analysis
             if request.force:
@@ -470,41 +502,53 @@ async def analyze_instagram(request: AnalyzeRequest, token: str = Depends(verify
                 logger.info(f"⚡ [{shortcode}] Found in cache! Returning instantly.")
 
         if cached_result:
+            title_cached = cached_result.get('title', '')
+            if not title_cached or title_cached.strip() == "":
+                from analyzers.youtube_analyzer import get_youtube_title
+                title_cached = get_youtube_title(cached_result.get('url', ''))
+                if title_cached:
+                    try:
+                        db._conn.execute("UPDATE analyses SET title = ? WHERE shortcode = ?", (title_cached, shortcode))
+                        db._conn.commit()
+                    except Exception:
+                        pass
+
             # Filter response
             filtered_data = {
                 'url': cached_result.get('url', ''),
                 'username': cached_result.get('username', ''),
                 'content_type': cached_result.get('content_type', content_type),
                 'thumbnail': cached_result.get('thumbnail', ''),
-                'title': cached_result.get('title', ''),
+                'title': title_cached,
                 'summary': cached_result.get('summary', ''),
                 'tags': cached_result.get('tags', []),
                 'music': cached_result.get('music', ''),
-                'category': cached_result.get('category', '')
+                'category': cached_result.get('category', ''),
+                'transcript_mode': cached_result.get('transcript_mode', 'native')
             }
-            
+
             processing_time = (datetime.now() - start_time).total_seconds()
             logger.info(f"✅ [{shortcode}] Response sent ({processing_time:.2f}s)")
-            
+
             return AnalysisResponse(
                 success=True,
                 cached=True,
                 data=filtered_data,
                 processing_time=processing_time
             )
-        
+
         # Step 2: Not in cache - check if already being processed
         logger.info(f"💾 [{shortcode}] Not in cache")
-        
+
         # Check if already in queue or processing
         processing_items = db.get_processing()
         if shortcode in processing_items:
             logger.warning(f"⏳ [{shortcode}] Already being processed. Please wait...")
             raise HTTPException(
-                status_code=409, 
+                status_code=409,
                 detail="This URL is already being analyzed. Please wait and try again in a moment."
             )
-        
+
         # Check if URL is already in queue - if so, remove the old queued item
         queue_items = db.get_queue()
         for item in queue_items:
@@ -512,7 +556,7 @@ async def analyze_instagram(request: AnalyzeRequest, token: str = Depends(verify
                 logger.info(f"🔄 [{shortcode}] Duplicate found in queue - removing old entry and processing fresh request")
                 db.remove_from_queue(shortcode)
                 break
-        
+
         # Step 3: Check queue size (re-fetch after potential duplicate removal)
         queue_items = db.get_queue()
         if len(processing_items) >= max_concurrent:
@@ -530,20 +574,25 @@ async def analyze_instagram(request: AnalyzeRequest, token: str = Depends(verify
                     status_code=500,
                     detail="Failed to add to queue. Please try again."
                 )
-        
+
         # Step 4: Start processing
         if len(queue_items) > 0:
             logger.info(f"📊 Queue status: {len(queue_items)} waiting | Starting: {shortcode}")
         logger.info(f"🚀 [{shortcode}] Starting analysis...")
         db.mark_processing(shortcode)
-        
+
         # Run main.py as subprocess — executed in a thread pool so the asyncio
         # event loop stays free to serve /ping and other requests during analysis.
         logger.info(f"📊 [{shortcode}] Phase 1: Downloading content...")
 
         def _run_subprocess() -> tuple:
+            cmd = [sys.executable, "main.py", url_str]
+            if request.use_youtube_transcripts:
+                cmd.append("--youtube-transcripts")
+            if request.transcribe_seconds and request.transcribe_seconds > 0:
+                cmd.extend(["--transcribe-seconds", str(request.transcribe_seconds)])
             proc = subprocess.Popen(
-                [sys.executable, "main.py", url_str],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -558,7 +607,11 @@ async def analyze_instagram(request: AnalyzeRequest, token: str = Depends(verify
             for line in proc.stdout:
                 lines.append(line)
                 lc = line.strip()
-                if "Step 4: Visual Analysis" in lc:
+                if "[TRANSCRIPT] Used existing YouTube transcript" in lc:
+                    logger.info(f"📜 [{shortcode}] Transcript: Using native YouTube transcript")
+                elif "[TRANSCRIPT] No native transcript found" in lc:
+                    logger.info(f"🎙️ [{shortcode}] Transcript: Using 60s Whisper audio transcription")
+                elif "Step 4: Visual Analysis" in lc:
                     logger.info(f"🎬 [{shortcode}] Phase 2: Visual analysis (AI processing)...")
                 elif "Step 5: Audio Transcription" in lc or "Phase 2: Audio" in lc:
                     logger.info(f"🎙️ [{shortcode}] Phase 3: Audio transcription (Whisper)...")
@@ -595,11 +648,11 @@ async def analyze_instagram(request: AnalyzeRequest, token: str = Depends(verify
                 status_code=504,
                 detail="Analysis timed out. The process took longer than the 10-minute allowed maximum."
             )
-        
+
         if stderr.strip():
             # Log stderr from main.py to help diagnose issues
             logger.warning(f"⚠️  [{shortcode}] main.py stderr:\n{stderr[:1000]}")
-        
+
         if returncode == 2:
             # main.py detected quota exhaustion (Instagram block or AI) and queued item for retry.
             # NOTE: Do NOT remove from queue here — main.py already called
@@ -609,7 +662,7 @@ async def analyze_instagram(request: AnalyzeRequest, token: str = Depends(verify
                 status_code=202,
                 detail="Rate limit or quota exhausted (often Instagram blocking the download). Your request has been queued for automatic retry in 24 hours."
             )
-        
+
         if returncode != 0:
             # Extract last meaningful error line from stdout for the error message
             error_lines = [l.strip() for l in stdout.splitlines() if l.strip() and ('❌' in l or 'Error' in l or 'failed' in l.lower())]
@@ -620,9 +673,9 @@ async def analyze_instagram(request: AnalyzeRequest, token: str = Depends(verify
                 status_code=400,
                 detail=error_detail
             )
-        
+
         logger.info(f"✅ [{shortcode}] Analysis complete! Fetching from database...")
-        
+
         # Get result from database — retry up to 4 times in case the SQLite write
         # hasn't flushed yet (race condition between subprocess write and our read).
         analysis = None
@@ -635,41 +688,55 @@ async def analyze_instagram(request: AnalyzeRequest, token: str = Depends(verify
             if _attempt < 3:
                 logger.warning(f"⏳ [{shortcode}] Not in DB yet (attempt {_attempt+1}/4), retrying in 1s…")
                 await asyncio.sleep(1)
-        
+
         if not analysis:
             logger.error(f"❌ [{shortcode}] Not found in database after 4 attempts!")
             raise HTTPException(
                 status_code=500,
                 detail="Analysis completed but result not found in database"
             )
-        
+
+        t_mode = analysis.get("transcript_mode", "")
+
+        title_val = analysis.get('title', '')
+        if not title_val or title_val.strip() == "":
+            from analyzers.youtube_analyzer import get_youtube_title
+            title_val = get_youtube_title(analysis.get('url', ''))
+            if title_val:
+                try:
+                    db._conn.execute("UPDATE analyses SET title = ? WHERE shortcode = ?", (title_val, shortcode))
+                    db._conn.commit()
+                except Exception:
+                    pass
+
         # Filter response
         filtered_data = {
             'url': analysis.get('url', ''),
             'username': analysis.get('username', ''),
             'content_type': analysis.get('content_type', content_type),
             'thumbnail': analysis.get('thumbnail', ''),
-            'title': analysis.get('title', ''),
+            'title': title_val,
             'summary': analysis.get('summary', ''),
             'tags': analysis.get('tags', []),
             'music': analysis.get('music', ''),
-            'category': analysis.get('category', '')
+            'category': analysis.get('category', ''),
+            'transcript_mode': t_mode
         }
-        
+
         processing_time = (datetime.now() - start_time).total_seconds()
         logger.info(f"✅ [{shortcode}] Response sent ({processing_time:.2f}s total)")
-        
+
         # Remove from processing queue
         db.remove_from_queue(shortcode)
         logger.info(f"🔓 [{shortcode}] Released from processing queue")
-        
+
         return AnalysisResponse(
             success=True,
             cached=False,
             data=filtered_data,
             processing_time=processing_time
         )
-        
+
     except HTTPException as he:
         # Don't remove from queue for 202 (retry-queued) — the item was
         # intentionally kept in the retry queue by main.py.
@@ -690,7 +757,7 @@ async def analyze_instagram(request: AnalyzeRequest, token: str = Depends(verify
 async def check_cache(shortcode: str, token: str = Depends(verify_token)):
     """
     Check if Instagram post is already analyzed and cached
-    
+
     - Returns cached analysis if available
     - Returns 404 if not found
     - Requires API authentication
@@ -698,10 +765,10 @@ async def check_cache(shortcode: str, token: str = Depends(verify_token)):
     try:
         db = get_db()
         result = db.check_cache(shortcode)
-        
+
         if not result:
             raise HTTPException(status_code=404, detail="Not found in cache")
-        
+
         # Filter response to only include essential fields
         filtered_data = {
             'url': result.get('url', ''),
@@ -712,13 +779,13 @@ async def check_cache(shortcode: str, token: str = Depends(verify_token)):
             'music': result.get('music', ''),
             'category': result.get('category', '')
         }
-        
+
         return {
             "success": True,
             "cached": True,
             "data": filtered_data
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -749,6 +816,9 @@ async def get_recent_analyses(
             "count": len(results),
             "total": total,
             "offset": offset,
+            "limit": limit,
+            "next_offset": offset + len(results) if offset + len(results) < total else None,
+            "has_more": offset + len(results) < total,
             "data": results
         }
 
@@ -760,6 +830,7 @@ async def get_recent_analyses(
 async def sync_posts(
     since: str = Query(..., description="ISO timestamp — return posts updated after this time"),
     limit: int = Query(default=500, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0, description="Number of matching rows to skip"),
     token: str = Depends(verify_token),
 ):
     """
@@ -769,12 +840,15 @@ async def sync_posts(
     """
     try:
         db = get_db()
-        results = db.get_posts_since(since, limit=limit)
+        results = db.get_posts_since(since, limit=limit, offset=offset)
 
         return {
             "success": True,
             "count": len(results),
             "since": since,
+            "offset": offset,
+            "next_offset": offset + len(results) if len(results) == limit else None,
+            "has_more": len(results) == limit,
             "data": results
         }
 
@@ -810,7 +884,7 @@ async def sync_deleted(
 async def get_database_stats(token: str = Depends(verify_token)):
     """
     Get database statistics
-    
+
     - Total documents
     - Storage usage
     - Category breakdown
@@ -820,12 +894,12 @@ async def get_database_stats(token: str = Depends(verify_token)):
     try:
         db = get_db()
         stats = db.get_stats()
-        
+
         return {
             "success": True,
             "data": stats
         }
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -840,7 +914,7 @@ async def get_all_categories(token: str = Depends(verify_token)):
         db = get_db()
         stats = db.get_stats()
         category_counts = stats.get('categories', {})
-        
+
         # Convert to list format with icons
         categories = []
         for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
@@ -849,13 +923,13 @@ async def get_all_categories(token: str = Depends(verify_token)):
                 'name': cat,
                 'count': count
             })
-        
+
         return {
             "success": True,
             "categories": categories,
             "total": sum(c['count'] for c in categories)
         }
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -868,22 +942,22 @@ async def get_by_category(
 ):
     """
     Get analyses by category
-    
-    Categories: product, places, food, fashion, fitness, education, 
+
+    Categories: product, places, food, fashion, fitness, education,
                 entertainment, pets, other
     - Requires API authentication
     """
     try:
         db = get_db()
         results = db.get_by_category(category, limit=limit)
-        
+
         return {
             "success": True,
             "category": category,
             "count": len(results),
             "data": results
         }
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -896,24 +970,24 @@ async def search_by_tags(
 ):
     """
     Search analyses by tags
-    
+
     - Provide comma-separated tags
     - Example: travel,sikkim,budget
     - Requires API authentication
     """
     try:
         tag_list = [tag.strip() for tag in tags.split(',')]
-        
+
         db = get_db()
         results = db.search_tags(tag_list, limit=limit)
-        
+
         return {
             "success": True,
             "tags": tag_list,
             "count": len(results),
             "data": results
         }
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -937,23 +1011,44 @@ async def status():
 
 
 @app.get("/connect-info")
-async def connect_info(request: Request):
+async def connect_info(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+):
     """
     Returns connection details for QR code scanning.
-    No auth required — used by the mobile app to auto-fill settings.
+    Used by the mobile app to auto-fill settings.
     The URL is built from the request so it matches whatever address the client used.
+
+    Returning the bearer token to an unauthenticated network caller defeats all
+    other API authorization. Legacy unauthenticated QR pairing can be explicitly
+    enabled only on trusted networks with ALLOW_UNAUTHENTICATED_CONNECT_INFO=1.
     """
+    allow_unauthenticated = os.getenv(
+        "ALLOW_UNAUTHENTICATED_CONNECT_INFO", ""
+    ).strip().lower() in {"1", "true", "yes"}
+    if not allow_unauthenticated and not secrets.compare_digest(
+        x_api_key or "", API_TOKEN
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="X-API-Key is required to retrieve connection credentials",
+        )
+
     # Build the base URL from the incoming request
     scheme = request.headers.get('x-forwarded-proto', request.url.scheme)
     host = request.headers.get('x-forwarded-host', request.headers.get('host', 'localhost:5000'))
     base_url = f"{scheme}://{host}"
 
-    return {
-        "url": base_url,
-        "token": API_TOKEN,
-        "version": "2.0.0",
-        "name": "SuperBrain"
-    }
+    return JSONResponse(
+        content={
+            "url": base_url,
+            "token": API_TOKEN,
+            "version": "2.0.0",
+            "name": "SuperBrain",
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/analysis-status/{shortcode}")
@@ -1116,14 +1211,14 @@ async def health_check(token: str = Depends(verify_token)):
     try:
         db = get_db()
         stats = db.get_stats()
-        
+
         return {
             "status": "healthy",
             "database": "connected",
             "documents": stats.get('document_count', 0),
             "timestamp": datetime.now().isoformat()
         }
-        
+
     except Exception as e:
         return {
             "status": "unhealthy",
@@ -1140,7 +1235,7 @@ async def queue_status(token: str = Depends(verify_token)):
         db = get_db()
         processing = db.get_processing()
         queue = db.get_queue()
-        
+
         retry_queue = db.get_retry_queue()
         return {
             "currently_processing": processing,
@@ -1204,16 +1299,16 @@ async def update_post(shortcode: str, updates: dict, token: str = Depends(verify
     """Update a post's category, title, or summary"""
     try:
         db = get_db()
-        
+
         # Only allow specific fields to be updated
         allowed_fields = {'category', 'title', 'summary'}
         filtered_updates = {k: v for k, v in updates.items() if k in allowed_fields}
-        
+
         if not filtered_updates:
             raise HTTPException(status_code=400, detail="No valid fields to update")
-        
+
         result = db.update_post(shortcode, filtered_updates)
-        
+
         if result:
             logger.info(f"✅ Updated post: {shortcode} - {list(filtered_updates.keys())}")
             return {
@@ -1224,7 +1319,7 @@ async def update_post(shortcode: str, updates: dict, token: str = Depends(verify
             }
         else:
             raise HTTPException(status_code=404, detail="Post not found")
-            
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1290,15 +1385,15 @@ async def reset_api_token(token: str = Depends(verify_token)):
     try:
         # Generate new 8-character alphanumeric token
         new_token = generate_api_token()
-        
+
         # Save to file
         TOKEN_FILE.write_text(new_token)
-        
+
         # Update in-memory token so it takes effect immediately
         API_TOKEN = new_token
-        
+
         logger.warning("API token was reset by a client")
-        
+
         return {
             "success": True,
             "new_token": new_token,
@@ -1321,7 +1416,7 @@ async def reset_database(
     """
     if confirm != "DELETE_ALL":
         raise HTTPException(status_code=400, detail="Confirmation required: pass confirm='DELETE_ALL'")
-    
+
     try:
         db = get_db()
 
@@ -1340,9 +1435,9 @@ async def reset_database(
         conn.commit()
 
         deleted_count = cur_posts.rowcount
-        
+
         logger.warning(f"🗑️ Database was reset by a client. Deleted {deleted_count} posts.")
-        
+
         return {
             "success": True,
             "deleted_count": deleted_count,
@@ -1373,18 +1468,18 @@ async def export_data(
     import tempfile
     import os
     import httpx
-    
+
     try:
         db = get_db()
-        
+
         # Get posts with pagination using SQLite
         posts = db.get_all_posts(limit=limit, offset=offset)
         # Convert sqlite3.Row objects to fully mutable dictionaries
         posts_list = [dict(p) for p in posts]
-        
+
         collections = db.get_all_collections()
         stats = db.get_stats()
-        
+
         export_payload = {
             "version": "1.0",
             "exported_at": datetime.now().isoformat(),
@@ -1392,18 +1487,18 @@ async def export_data(
             "collections": collections,
             "stats": stats
         }
-        
+
         if format.lower() == "zip":
             # Create a zip file on disk to avoid memory explosion
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
             zip_path = tmp.name
             tmp.close()
-            
+
             async def download_image(client, sem, post_dict):
                 url = post_dict.get('thumbnail_url') or post_dict.get('thumbnail')
                 if not url:
                     return None
-                    
+
                 shortcode = post_dict.get('shortcode')
                 if not shortcode: return None
 
@@ -1426,7 +1521,7 @@ async def export_data(
                         ext = "jpg"
                         if "png" in header.lower(): ext = "png"
                         elif "webp" in header.lower(): ext = "webp"
-                        
+
                         img_data = base64.b64decode(encoded)
                         path_in_zip = f"thumbnails/{shortcode}.{ext}"
                         post_dict['thumbnail'] = f"/static/{path_in_zip}"
@@ -1434,11 +1529,11 @@ async def export_data(
                     except Exception as e:
                         logger.error(f"Failed decoding base64 image for {shortcode}: {e}")
                         return None
-                        
+
                 ext = "jpg"
                 if ".png" in url.lower(): ext = "png"
                 elif ".webp" in url.lower(): ext = "webp"
-                
+
                 path_in_zip = f"thumbnails/{shortcode}.{ext}"
                 try:
                     async with sem:
@@ -1456,7 +1551,7 @@ async def export_data(
             async with httpx.AsyncClient(verify=False) as client:
                 for post in export_payload["posts"]:
                     tasks.append(download_image(client, sem, post))
-                
+
                 downloaded_images = await asyncio.gather(*tasks)
 
             # Write everything to the zip sequentially to save RAM
@@ -1467,13 +1562,13 @@ async def export_data(
                     if res:
                         path_in_zip, content = res
                         zip_file.writestr(path_in_zip, content)
-                        
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"superbrain_export_{timestamp}.zip"
-            
+
             background_tasks.add_task(os.remove, zip_path)
             return FileResponse(zip_path, media_type="application/zip", filename=filename)
-        
+
         # Default JSON response
         return export_payload
     except Exception as e:
@@ -1509,33 +1604,33 @@ async def import_data_file(
     """
     try:
         content = await file.read()
-        
+
         # Check if it's a ZIP file
         if file.filename.endswith('.zip') or file.content_type == 'application/zip' or content.startswith(b'PK'):
             try:
                 with zipfile.ZipFile(io.BytesIO(content)) as z:
                     # Look for superbrain_export.json or any json file
                     json_files = [name for name in z.namelist() if name.endswith('.json')]
-                    
+
                     if not json_files:
                         raise HTTPException(status_code=400, detail="No JSON file found in the ZIP archive")
-                    
+
                     # Prefer superbrain_export.json if it exists
                     target_file = "superbrain_export.json" if "superbrain_export.json" in json_files else json_files[0]
-                    
+
                     with z.open(target_file) as f:
                         data = json.load(f)
-                    
+
                     # Extract any custom image thumbnails from /thumbnails directory to the static folder mapped statically
                     thumbnails_dir = _STATIC_DIR / "thumbnails"
                     thumbnails_dir.mkdir(parents=True, exist_ok=True)
-                    
+
                     for name in z.namelist():
                         if name.startswith("thumbnails/") and not name.endswith("/"):
                             img_filename = name.split("/")[-1]
                             with z.open(name) as zf, open(thumbnails_dir / img_filename, "wb") as out_f:
                                 out_f.write(zf.read())
-                                
+
             except zipfile.BadZipFile:
                 raise HTTPException(status_code=400, detail="Invalid ZIP file")
         else:
@@ -1544,9 +1639,9 @@ async def import_data_file(
                 data = json.loads(content.decode('utf-8'))
             except json.JSONDecodeError:
                 raise HTTPException(status_code=400, detail="Invalid JSON file")
-                
+
         return await _process_import_data(data, mode)
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1677,7 +1772,7 @@ async def get_ai_providers(token: str = Depends(verify_token)):
     from core.model_router import get_router
     router = get_router()
     providers = router.get_available_providers()
-    
+
     return {
         "success": True,
         "providers": {
@@ -1716,7 +1811,7 @@ async def set_ai_provider_key(
     """
     from core.model_router import get_router
     import httpx
-    
+
     valid_providers = ["groq", "gemini", "openrouter"]
     provider_slug = data.provider.lower()
     if provider_slug not in valid_providers:
@@ -1724,10 +1819,10 @@ async def set_ai_provider_key(
             status_code=400,
             detail=f"Invalid provider. Must be one of: {', '.join(valid_providers)}"
         )
-    
+
     if not data.api_key or len(data.api_key.strip()) < 5:
         raise HTTPException(status_code=400, detail="Invalid API key format")
-        
+
     # Validate API key explicitly
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1745,10 +1840,10 @@ async def set_ai_provider_key(
                     raise HTTPException(status_code=401, detail="Invalid OpenRouter API Key")
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Network error validating API key: {e}")
-    
+
     router = get_router()
     success = router.set_api_key(data.provider.lower(), data.api_key.strip())
-    
+
     if success:
         logger.info(f"🔑 API key updated for {data.provider}")
         return {"success": True, "provider": data.provider, "message": "API key updated"}
@@ -1765,17 +1860,17 @@ async def delete_ai_provider_key(
     - Requires API authentication
     """
     from core.model_router import get_router
-    
+
     valid_providers = ["groq", "gemini", "openrouter"]
     if provider.lower() not in valid_providers:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid provider. Must be one of: {', '.join(valid_providers)}"
         )
-    
+
     router = get_router()
     success = router.delete_api_key(provider.lower())
-    
+
     if success:
         logger.info(f"🔑 API key deleted for {provider}")
         return {"success": True, "provider": provider, "message": "API key deleted"}
@@ -1789,10 +1884,10 @@ async def get_instagram_credentials(token: str = Depends(verify_token)):
     - Requires API authentication
     """
     api_keys_file = get_config_path(".api_keys")
-    
+
     username = None
     has_password = False
-    
+
     if api_keys_file.exists():
         with open(api_keys_file, "r") as f:
             for line in f:
@@ -1800,7 +1895,7 @@ async def get_instagram_credentials(token: str = Depends(verify_token)):
                     username = line.split("=", 1)[1].strip()
                 elif line.startswith("INSTAGRAM_PASSWORD="):
                     has_password = bool(line.split("=", 1)[1].strip())
-    
+
     return {
         "success": True,
         "configured": username is not None and username != "",
@@ -1818,14 +1913,14 @@ async def set_instagram_credentials(
     - Requires API authentication
     """
     sessionid = getattr(data, "sessionid", None)
-    
+
     if not sessionid and (not data.username or not data.password):
         raise HTTPException(status_code=400, detail="Either login (username + password) OR Session ID is required")
-        
+
     username_to_use = data.username or "session_user"
-    
+
     api_keys_file = get_config_path(".api_keys")
-    
+
     # Authenticate with Instagram first
     try:
         import instaloader
@@ -1838,13 +1933,13 @@ async def set_instagram_credentials(
             try:
                 L.get_profile("instagram")
             except Exception:
-                # Some sessionids might have minor issues fetching profiles but work for posts, 
+                # Some sessionids might have minor issues fetching profiles but work for posts,
                 # but getting "instagram" is generally safe. Ignore non-fatal if possible
                 pass
         else:
             L.login(data.username, data.password)
             username_to_use = data.username
-            
+
         L.save_session_to_file(str(session_file))
         logger.info(f"🍪 Instagram session successfully verified and saved for {username_to_use}")
     except instaloader.exceptions.BadCredentialsException:
@@ -1863,7 +1958,7 @@ async def set_instagram_credentials(
     lines = []
     username_found = False
     password_found = False
-    
+
     if api_keys_file.exists():
         with open(api_keys_file, "r") as f:
             for line in f:
@@ -1878,7 +1973,7 @@ async def set_instagram_credentials(
                     password_found = True
                 else:
                     lines.append(line)
-    
+
     if not username_found:
         lines.append(f"INSTAGRAM_USERNAME={username_to_use}\n")
     if not password_found:
@@ -1886,12 +1981,12 @@ async def set_instagram_credentials(
             lines.append(f"INSTAGRAM_PASSWORD={data.password}\n")
         else:
             lines.append("INSTAGRAM_PASSWORD=\n")
-    
+
     with open(api_keys_file, "w") as f:
         f.writelines(lines)
-        
+
     logger.info(f"📸 Instagram credentials updated for {username_to_use}")
-    
+
     return {
         "success": True,
         "username": username_to_use,
@@ -1905,20 +2000,360 @@ async def delete_instagram_credentials(token: str = Depends(verify_token)):
     - Requires API authentication
     """
     api_keys_file = get_config_path(".api_keys")
-    
+
     if api_keys_file.exists():
         lines = []
         with open(api_keys_file, "r") as f:
             for line in f:
                 if not line.startswith("INSTAGRAM_USERNAME=") and not line.startswith("INSTAGRAM_PASSWORD="):
                     lines.append(line)
-        
+
         with open(api_keys_file, "w") as f:
             f.writelines(lines)
-    
+
     logger.info("📸 Instagram credentials deleted")
-    
+
     return {"success": True, "message": "Instagram credentials deleted"}
+
+
+# ── YouTube WebSub (PubSubHubbub) Server Startup & Webhook Endpoints ───────
+
+WEBSUB_MAX_BODY_BYTES = int(os.getenv("WEBSUB_MAX_BODY_BYTES", str(1024 * 1024)))
+WEBSUB_RENEW_INTERVAL_SECONDS = int(
+    os.getenv("WEBSUB_RENEW_INTERVAL_SECONDS", str(6 * 60 * 60))
+)
+
+
+def _websub_secret() -> str:
+    return os.getenv("WEBSUB_HMAC_SECRET", "")
+
+
+def _try_acquire_websub_leader_lock():
+    """Elect one Uvicorn worker to perform periodic lease renewal."""
+    try:
+        import fcntl
+
+        database_identity = str(Path(get_db().db_path).resolve())
+        lock_suffix = hashlib.sha256(
+            database_identity.encode("utf-8")
+        ).hexdigest()[:24]
+        path = (
+            Path(tempfile.gettempdir())
+            / f"superbrain_websub_renewer_{lock_suffix}.lock"
+        )
+        lock_file = path.open("a+")
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_file.close()
+            return None
+        return lock_file
+    except Exception as exc:
+        logger.warning("WebSub renewal leader election unavailable: %s", exc)
+        return None
+
+
+def _release_websub_leader_lock(lock_file):
+    if lock_file is None:
+        return
+    try:
+        import fcntl
+
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
+
+async def _renew_websub_subscriptions_once():
+    secret = _websub_secret()
+    if not secret:
+        logger.warning(
+            "WebSub renewal disabled: WEBSUB_HMAC_SECRET is not configured"
+        )
+        return
+    database = get_db()
+    candidates = database.get_websub_renewal_candidates(within_hours=48)
+    if not candidates:
+        return
+    from core.websub_notifier import build_topic_url, subscribe_channels
+
+    grouped = {}
+    for row in candidates:
+        callback = row.get("callback_url")
+        channel_id = row.get("channel_id")
+        if callback and channel_id:
+            grouped.setdefault(callback, []).append(channel_id)
+            database.upsert_websub_subscription(
+                channel_id=channel_id,
+                channel_title=row.get("channel_title") or "",
+                callback_url=callback,
+                topic_url=row.get("topic_url") or build_topic_url(channel_id),
+                lease_seconds=row.get("lease_seconds") or 864000,
+                status="pending",
+            )
+
+    for callback, channel_ids in grouped.items():
+        logger.info(
+            "🔄 [WebSub] Renewing %d subscription(s) for %s",
+            len(channel_ids),
+            callback,
+        )
+        results = await asyncio.to_thread(
+            subscribe_channels,
+            channel_ids,
+            callback,
+            864000,
+            secret,
+        )
+        for detail in results["details"]:
+            if not detail["success"]:
+                database.mark_websub_failed(
+                    detail["channel_id"], detail["message"]
+                )
+
+
+async def _websub_renewal_loop():
+    while True:
+        try:
+            await _renew_websub_subscriptions_once()
+        except Exception as exc:
+            logger.warning("⚠️ [WebSub] Renewal pass failed: %s", exc)
+        await asyncio.sleep(WEBSUB_RENEW_INTERVAL_SECONDS)
+
+
+@app.get("/api/youtube/webhook")
+async def youtube_websub_verification(request: Request):
+    """
+    Google WebSub GET verification challenge callback endpoint.
+    Google sends a GET request with hub.challenge, hub.mode, and hub.topic.
+    SuperBrain echoes back hub.challenge to verify subscription.
+    """
+    params = dict(request.query_params)
+    mode = params.get("hub.mode")
+    topic = params.get("hub.topic", "")
+    challenge = params.get("hub.challenge")
+    lease = params.get("hub.lease_seconds")
+
+    logger.info(f"🌐 [WebSub] Received GET verification challenge for topic: {topic} (mode={mode})")
+    database = get_db()
+    subscription = database.get_websub_subscription_by_topic(topic)
+    if mode == "denied":
+        if subscription:
+            database.mark_websub_failed(
+                subscription["channel_id"],
+                params.get("hub.reason", "Hub denied subscription"),
+            )
+        return Response(status_code=204)
+    if not subscription:
+        raise HTTPException(
+            status_code=404,
+            detail="No pending WebSub operation matches this topic",
+        )
+    try:
+        from core.websub_notifier import verify_websub_challenge
+        resp_challenge = verify_websub_challenge(
+            mode,
+            topic,
+            challenge,
+            lease,
+            expected_topic=subscription["topic_url"],
+            expected_mode=subscription.get("pending_mode"),
+        )
+        if not database.mark_websub_verified(topic, mode, lease):
+            raise ValueError("Pending WebSub operation changed before verification")
+        return Response(content=resp_challenge, media_type="text/plain")
+    except Exception as e:
+        logger.error(f"❌ [WebSub] Verification challenge failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/youtube/webhook")
+async def youtube_websub_notification(request: Request):
+    """
+    Google WebSub POST push notification endpoint.
+    Google sends an Atom XML payload when a subscribed YouTube channel uploads a video.
+    Parses the payload and triggers automatic YouTube video analysis.
+    """
+    body_bytes = await request.body()
+    if len(body_bytes) > WEBSUB_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="WebSub payload too large")
+    secret = _websub_secret()
+    if not secret:
+        raise HTTPException(
+            status_code=503,
+            detail="WebSub HMAC verification is not configured",
+        )
+    from core.websub_notifier import verify_websub_signature
+
+    signature = request.headers.get("x-hub-signature", "")
+    if not verify_websub_signature(body_bytes, signature, secret):
+        logger.warning("Rejected WebSub notification with invalid signature")
+        raise HTTPException(status_code=401, detail="Invalid WebSub signature")
+
+    logger.info("🔔 [WebSub] Received real-time YouTube upload push notification from Google Hub!")
+    try:
+        from core.websub_notifier import parse_websub_atom_payload
+        data = parse_websub_atom_payload(body_bytes)
+        video_url = data["video_url"]
+        title = data.get("title", "")
+        channel_id = data.get("channel_id", "")
+
+        logger.info(f"📹 [WebSub Push] New Video Upload: '{title}' ({video_url}) [Channel: {channel_id}]")
+        database = get_db()
+        subscription = database.get_websub_subscription(channel_id)
+        if not subscription or subscription.get("status") != "active":
+            raise HTTPException(
+                status_code=403,
+                detail="Notification channel is not actively subscribed",
+            )
+        validation = validate_link(video_url)
+        if not validation["valid"]:
+            raise HTTPException(status_code=400, detail="Invalid YouTube video ID")
+        shortcode = validation["shortcode"]
+        if database.check_cache(shortcode):
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "duplicate",
+                    "video_url": video_url,
+                    "title": title,
+                },
+            )
+        position = database.add_to_queue(shortcode, video_url)
+        if position < 0:
+            raise HTTPException(
+                status_code=500, detail="Could not enqueue WebSub notification"
+            )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "queued" if position > 0 else "processing",
+                "video_url": video_url,
+                "title": title,
+                "queue_position": position,
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"⚠️ [WebSub Push] Failed to parse Atom XML payload: {e}")
+        return Response(content=f"Error parsing XML: {e}", status_code=400)
+
+
+@app.post("/api/youtube/subscribe")
+async def subscribe_youtube_channels(
+    request: Request,
+    callback_url: Optional[str] = Query(None, description="Public HTTPS callback URL of SuperBrain"),
+    token: str = Depends(verify_token)
+):
+    """
+    Subscribe SuperBrain to 200+ YouTube channel feeds via Google WebSub.
+    Accepts OPML XML file upload (from Google Takeout) or a list of channel IDs.
+    """
+    if not callback_url:
+        # Fallback to request host
+        host = request.headers.get("host", "localhost:5000")
+        scheme = request.headers.get("x-forwarded-proto", "https")
+        callback_url = f"{scheme}://{host}/api/youtube/webhook"
+
+    parsed_callback = urlsplit(callback_url)
+    if parsed_callback.scheme != "https" and parsed_callback.hostname not in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="WebSub callback_url must use HTTPS",
+        )
+    secret = _websub_secret()
+    if not secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Configure WEBSUB_HMAC_SECRET before subscribing",
+        )
+
+    from core.websub_notifier import (
+        build_topic_url,
+        parse_opml_subscriptions,
+        subscribe_channels,
+    )
+
+    extracted_channels = []
+    channel_ids = []
+    content_type = request.headers.get("content-type", "")
+    try:
+        if content_type.startswith("multipart/form-data"):
+            form = await request.form()
+            upload = form.get("file")
+            if upload is not None and hasattr(upload, "read"):
+                content = (await upload.read()).decode("utf-8", errors="strict")
+                extracted_channels = parse_opml_subscriptions(content)
+                channel_ids = [item["channel_id"] for item in extracted_channels]
+            else:
+                channel_ids = list(form.getlist("channel_ids"))
+        else:
+            payload = await request.json()
+            if isinstance(payload, list):
+                channel_ids = payload
+            elif isinstance(payload, dict):
+                channel_ids = payload.get("channel_ids") or []
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not channel_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide an OPML file upload or channel_ids list",
+        )
+    try:
+        c_ids = list(dict.fromkeys(str(cid).strip() for cid in channel_ids))
+        topics = {cid: build_topic_url(cid) for cid in c_ids}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    titles = {
+        item["channel_id"]: item.get("title", "") for item in extracted_channels
+    }
+
+    logger.info(f"🚀 [WebSub] Batch subscribing to {len(c_ids)} channels with callback: {callback_url}")
+    database = get_db()
+    for cid in c_ids:
+        database.upsert_websub_subscription(
+            channel_id=cid,
+            channel_title=titles.get(cid, ""),
+            callback_url=callback_url,
+            topic_url=topics[cid],
+            status="pending",
+        )
+    results = await asyncio.to_thread(
+        subscribe_channels,
+        c_ids,
+        callback_url,
+        864000,
+        secret,
+    )
+    for detail in results["details"]:
+        if not detail["success"]:
+            database.mark_websub_failed(
+                detail["channel_id"], detail["message"]
+            )
+
+    return {
+        "success": results["failed"] == 0,
+        "callback_url": callback_url,
+        "pending_verification_count": results["success"],
+        "failed_count": results["failed"],
+        "total": results["total"],
+        "details": results["details"],
+    }
+
+
+@app.get("/api/youtube/subscriptions")
+async def list_youtube_subscriptions(token: str = Depends(verify_token)):
+    """List YouTube WebSub subscriptions and their verification status."""
+    database = get_db()
+    subs = database.list_websub_subscriptions()
+    return {"count": len(subs), "subscriptions": subs}
 
 
 if __name__ == "__main__":
