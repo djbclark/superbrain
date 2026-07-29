@@ -8,11 +8,13 @@ Landed in this fork:
 - `backend/config/categories.toml.example` (real `categories.toml` gitignored)
 - Additive SQLite category metadata columns
 - Analysis paths classify via config taxonomy (no keyword fallback)
-- `backend/scripts/recategorize.py` for backup / dry-run / apply / rollback
+- `backend/scripts/recategorize.py` for backup / dry-run / apply / rollback /
+  playlists (operator sequences: [`RECATEGORIZE.md`](RECATEGORIZE.md))
 - `category_manager.py` deprecated stub (MongoDB-era; exits with guidance)
 
 Live migration of existing rows still requires operator dry-run review before
-`recategorize.py apply`.
+`recategorize.py apply` (except `playlists`, which writes as it goes behind an
+explicit `--i-understand-this-writes-categories` gate).
 
 ## Operator requirements captured so far
 

@@ -4,6 +4,14 @@
 
 ---
 
+## Recategorize (taxonomy migration)
+
+Operator cookbook: [`docs/RECATEGORIZE.md`](RECATEGORIZE.md)  
+CLI: `backend/scripts/recategorize.py` (`validate` → `backup` → `dry-run` → `apply`,
+or `playlists` for Watch Later–style scoped writes).
+
+---
+
 ## 📊 Codebase At a Glance
 
 | Metric | Value |

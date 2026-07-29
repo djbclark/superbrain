@@ -5,16 +5,17 @@ Metadata-only category taxonomy migration for SQLite SuperBrain databases.
 Does NOT redownload media or regenerate transcripts/analyses.
 Does NOT use the deprecated MongoDB-era category_manager.
 
-Typical flow:
-  1. Place config/categories.toml (from categories.toml.example)
-  2. python scripts/recategorize.py backup
-  3. python scripts/recategorize.py dry-run --out /tmp/recategorize-report.jsonl \\
-        --only-outside-taxonomy   # optional: legacy labels only
-  4. Operator reviews aggregates + sample
-  5. python scripts/recategorize.py apply --from-report /tmp/recategorize-report.jsonl \\
-        --only-changed            # optional: skip no-op rows
-  6. python scripts/recategorize.py suggestions --from-report ...
-  7. On failure: python scripts/recategorize.py rollback --backup <path>
+Operator cookbook (copy-paste sequences): docs/RECATEGORIZE.md
+
+Quick flow — legacy labels only (other/product/software/…):
+  validate → backup → dry-run --only-outside-taxonomy → review summary →
+  apply --only-changed --i-understand-this-writes-categories → suggestions
+
+Quick flow — playlists (writes as it goes; resumable JSONL):
+  playlists --playlist … --cookies chrome --resume --workers N \\
+    --i-understand-this-writes-categories
+
+See also: python scripts/recategorize.py --help
 """
 
 from __future__ import annotations
@@ -720,7 +721,25 @@ def cmd_rollback(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  # Legacy-label sweep (see docs/RECATEGORIZE.md for full env/paths)
+  %(prog)s --database ~/.superbrain-server/superbrain.db \\
+           --config ~/.superbrain-server/config/categories.toml backup
+  %(prog)s ... dry-run --out /tmp/legacy.jsonl --only-outside-taxonomy --progress
+  %(prog)s ... apply --from-report /tmp/legacy.jsonl --only-changed \\
+           --i-understand-this-writes-categories
+  %(prog)s ... suggestions --from-report /tmp/legacy.jsonl
+
+  # Playlist apply (resumable)
+  %(prog)s ... playlists --playlist 'https://www.youtube.com/playlist?list=WL' \\
+           --cookies chrome --resume --workers 4 \\
+           --i-understand-this-writes-categories
+""",
+    )
     p.add_argument(
         "--database",
         default=str(DB_PATH),

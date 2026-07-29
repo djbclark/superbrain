@@ -50,6 +50,8 @@ Before changing code or data:
 
 - Do not use `backend/core/category_manager.py` as the migration path; it is a
   stale MongoDB-era utility and is incompatible with active SQLite use.
+- Use `backend/scripts/recategorize.py` only. Command sequences:
+  [`RECATEGORIZE.md`](RECATEGORIZE.md).
 - Do not perform a destructive database rebuild. Recategorize existing metadata
   only; do not redownload videos or regenerate transcripts/analyses for a
   taxonomy-only change.

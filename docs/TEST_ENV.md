@@ -39,6 +39,9 @@ export SUPERBRAIN_REFERENCE_DATABASE_PATH="$HOME/.superbrain-server/superbrain.d
 capped metadata-fetch budget (`--missing-ai-timeout`, default 20s) on videos
 that are not present locally.
 
+Full migration command sequences (legacy sweep, full corpus, playlists):
+[`RECATEGORIZE.md`](RECATEGORIZE.md).
+
 Local omlx on port 8000 is configured through `OMLX_HOST` /
 `SUPERBRAIN_API_KEYS_FILE` (see `~/.superbrain-server-test/config/`).
 
