@@ -8,9 +8,11 @@ Does NOT use the deprecated MongoDB-era category_manager.
 Typical flow:
   1. Place config/categories.toml (from categories.toml.example)
   2. python scripts/recategorize.py backup
-  3. python scripts/recategorize.py dry-run --out /tmp/recategorize-report.jsonl
+  3. python scripts/recategorize.py dry-run --out /tmp/recategorize-report.jsonl \\
+        --only-outside-taxonomy   # optional: legacy labels only
   4. Operator reviews aggregates + sample
-  5. python scripts/recategorize.py apply --from-report /tmp/recategorize-report.jsonl
+  5. python scripts/recategorize.py apply --from-report /tmp/recategorize-report.jsonl \\
+        --only-changed            # optional: skip no-op rows
   6. python scripts/recategorize.py suggestions --from-report ...
   7. On failure: python scripts/recategorize.py rollback --backup <path>
 """
@@ -446,8 +448,22 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
         print(f"Invalid taxonomy: {exc}", file=sys.stderr)
         return 1
 
+    only_categories = None
+    if getattr(args, "only_categories", None):
+        only_categories = [
+            part.strip()
+            for part in str(args.only_categories).split(",")
+            if part.strip()
+        ]
+    outside = taxonomy.names if getattr(args, "only_outside_taxonomy", False) else None
+
     db = _open_db(Path(args.database))
-    rows = db.list_visible_for_recategorize(limit=args.limit, offset=args.offset)
+    rows = db.list_visible_for_recategorize(
+        limit=args.limit,
+        offset=args.offset,
+        only_categories=only_categories,
+        outside_taxonomy_names=outside,
+    )
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -455,6 +471,13 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
     change_matrix: dict[str, int] = {}
     fallback_count = 0
     suggestion_lists: list[list[str]] = []
+
+    print(
+        f"dry-run selecting {len(rows)} rows "
+        f"(only_outside_taxonomy={bool(outside)} "
+        f"only_categories={only_categories or []})",
+        flush=True,
+    )
 
     with out_path.open("w", encoding="utf-8") as fh:
         for i, row in enumerate(rows, start=1):
@@ -479,6 +502,8 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
                 "taxonomy_version": taxonomy.version,
             }
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if i % 10 == 0:
+                fh.flush()
             counts[result.category] = counts.get(result.category, 0) + 1
             key = f"{old} -> {result.category}"
             change_matrix[key] = change_matrix.get(key, 0) + 1
@@ -494,6 +519,10 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
         "database": str(Path(args.database)),
         "taxonomy_version": taxonomy.version,
         "taxonomy_names": taxonomy.names,
+        "filter": {
+            "only_outside_taxonomy": bool(outside),
+            "only_categories": only_categories or [],
+        },
         "rows": len(rows),
         "assigned_counts": counts,
         "change_matrix": change_matrix,
@@ -537,7 +566,9 @@ def cmd_apply(args: argparse.Namespace) -> int:
 
     applied = 0
     skipped = 0
+    skipped_unchanged = 0
     failed = 0
+    only_changed = bool(getattr(args, "only_changed", False))
     with report_path.open(encoding="utf-8") as fh, state_path.open(
         "a", encoding="utf-8"
     ) as state_fh:
@@ -573,13 +604,21 @@ def cmd_apply(args: argparse.Namespace) -> int:
             if rec["shortcode"] in done:
                 skipped += 1
                 continue
+            if only_changed and (rec.get("old_category") or "") == (
+                rec.get("new_category") or ""
+            ):
+                skipped_unchanged += 1
+                state_fh.write(rec["shortcode"] + "\n")
+                done.add(rec["shortcode"])
+                continue
             batch.append(rec)
             if len(batch) >= args.batch_size:
                 flush(batch)
                 batch.clear()
                 if args.progress:
                     print(
-                        f"apply progress: applied={applied} failed={failed} skipped={skipped}",
+                        f"apply progress: applied={applied} failed={failed} "
+                        f"skipped={skipped} unchanged={skipped_unchanged}",
                         flush=True,
                     )
         if batch:
@@ -592,6 +631,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
                 "applied": applied,
                 "failed": failed,
                 "skipped_already_done": skipped,
+                "skipped_unchanged": skipped_unchanged,
                 "state": str(state_path),
             },
             indent=2,
@@ -705,6 +745,16 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--limit", type=int, default=None)
     d.add_argument("--offset", type=int, default=0)
     d.add_argument("--progress", action="store_true")
+    d.add_argument(
+        "--only-outside-taxonomy",
+        action="store_true",
+        help="Only classify rows whose category is not an exact taxonomy name",
+    )
+    d.add_argument(
+        "--only-categories",
+        default=None,
+        help="Comma-separated exact category labels to include (e.g. other,product,software)",
+    )
     d.set_defaults(func=cmd_dry_run)
 
     a = sub.add_parser("apply", help="Apply categories from a reviewed dry-run report")
@@ -712,6 +762,11 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--batch-size", type=int, default=50)
     a.add_argument("--state", default=None, help="Resume marker file")
     a.add_argument("--progress", action="store_true")
+    a.add_argument(
+        "--only-changed",
+        action="store_true",
+        help="Skip report rows where old_category already equals new_category",
+    )
     a.add_argument(
         "--i-understand-this-writes-categories",
         dest="i_understand",

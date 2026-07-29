@@ -437,8 +437,21 @@ class Database:
             print(f"[WARNING]  Error updating category metadata: {e}")
             return False
 
-    def list_visible_for_recategorize(self, limit=None, offset=0):
-        """Return light rows used by taxonomy migration (excludes soft-deleted)."""
+    def list_visible_for_recategorize(
+        self,
+        limit=None,
+        offset=0,
+        *,
+        only_categories=None,
+        outside_taxonomy_names=None,
+    ):
+        """Return light rows used by taxonomy migration (excludes soft-deleted).
+
+        Filters (optional, may combine):
+          only_categories: exact category string matches (e.g. legacy labels)
+          outside_taxonomy_names: keep rows whose category is not in this set
+            (comparison is exact; legacy ``other`` is outside ``Other``)
+        """
         if not self.is_connected():
             return []
         try:
@@ -446,10 +459,28 @@ class Database:
             sql = (
                 "SELECT shortcode, title, summary, tags, category, "
                 "audio_transcription, text_analysis, visual_analysis "
-                "FROM analyses WHERE (is_hidden IS NULL OR is_hidden = 0) "
-                "ORDER BY shortcode"
+                "FROM analyses WHERE (is_hidden IS NULL OR is_hidden = 0)"
             )
             params: list = []
+            if only_categories:
+                cats = [str(c) for c in only_categories if str(c)]
+                if not cats:
+                    return []
+                placeholders = ",".join("?" for _ in cats)
+                sql += f" AND category IN ({placeholders})"
+                params.extend(cats)
+            if outside_taxonomy_names is not None:
+                names = [str(n) for n in outside_taxonomy_names]
+                if names:
+                    placeholders = ",".join("?" for _ in names)
+                    sql += (
+                        f" AND (category IS NULL OR category NOT IN ({placeholders}))"
+                    )
+                    params.extend(names)
+                else:
+                    # Empty taxonomy → every row is "outside"
+                    pass
+            sql += " ORDER BY shortcode"
             if limit is not None:
                 sql += " LIMIT ? OFFSET ?"
                 params.extend([int(limit), int(offset)])
