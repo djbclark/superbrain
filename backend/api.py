@@ -2539,6 +2539,10 @@ async def youtube_oauth_status(token: str = Depends(verify_token)):
         "authorized": bool(os.getenv("YOUTUBE_OAUTH_REFRESH_TOKEN")),
         "redirect_uri": _YOUTUBE_OAUTH_REDIRECT_URI,
         "oauth_scope": youtube_oauth.SCOPE,
+        "connect_hint": (
+            "Open /api/youtube/oauth/start?token=… in a browser on this machine, "
+            "or run: python scripts/youtube_oauth_connect.py"
+        ),
         "category_playlists": {
             "enabled": sync_cfg.enabled,
             "dry_run": sync_cfg.dry_run,
@@ -2548,12 +2552,26 @@ async def youtube_oauth_status(token: str = Depends(verify_token)):
     }
 
 
-@app.post("/api/youtube/oauth/start")
-async def youtube_oauth_start(token: str = Depends(verify_token)):
+def _begin_youtube_oauth() -> str:
     from core import youtube_oauth
+
     state, verifier, challenge = youtube_oauth.new_pkce()
     _YOUTUBE_OAUTH_PENDING[state] = (verifier, time.monotonic() + 600)
-    return {"authorization_url": youtube_oauth.authorization_url(_YOUTUBE_OAUTH_REDIRECT_URI, state, challenge)}
+    return youtube_oauth.authorization_url(_YOUTUBE_OAUTH_REDIRECT_URI, state, challenge)
+
+
+@app.post("/api/youtube/oauth/start")
+async def youtube_oauth_start(token: str = Depends(verify_token)):
+    """Start OAuth; returns JSON with authorization_url (Google consent link)."""
+    return {"authorization_url": _begin_youtube_oauth()}
+
+
+@app.get("/api/youtube/oauth/start")
+async def youtube_oauth_start_browser(token: str = Depends(verify_token)):
+    """Browser-friendly start: 302 redirect straight to Google consent."""
+    from fastapi.responses import RedirectResponse
+
+    return RedirectResponse(_begin_youtube_oauth(), status_code=302)
 
 
 @app.get("/api/youtube/oauth/callback")
@@ -2569,7 +2587,18 @@ async def youtube_oauth_callback(code: str = "", state: str = "", error: str = "
     if not refresh_token:
         raise HTTPException(status_code=400, detail="Google did not return a refresh token; revoke access and retry")
     await asyncio.to_thread(youtube_oauth.persist_refresh_token, refresh_token)
-    return Response("YouTube connected. Return to SuperBrain and discover subscriptions.", media_type="text/plain")
+    html = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>YouTube connected</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;line-height:1.5}
+code{background:#f4f4f4;padding:.1rem .35rem;border-radius:4px}
+</style></head><body>
+<h1>YouTube connected</h1>
+<p>SuperBrain stored a new refresh token (playlist-capable scope).</p>
+<p>You can close this tab. Next: enable <code>[youtube_playlists]</code> in
+<code>categories.toml</code> when you are ready to sync.</p>
+</body></html>"""
+    return Response(html, media_type="text/html")
 
 
 @app.post("/api/youtube/subscriptions/discover")
