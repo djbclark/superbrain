@@ -163,6 +163,28 @@ def run_local_browser_connect(
 
     Used by `superbrain --youtube-connect`. Returns a process exit code.
     """
+    from core.cli_locks import CliLockUnavailable, exclusive_cli_lock
+
+    try:
+        with exclusive_cli_lock("youtube-connect"):
+            return _run_local_browser_connect_unlocked(
+                base_url=base_url,
+                token_file=token_file,
+                open_browser=open_browser,
+                timeout=timeout,
+            )
+    except CliLockUnavailable as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
+
+
+def _run_local_browser_connect_unlocked(
+    *,
+    base_url: str = DEFAULT_API_BASE,
+    token_file: Path | None = None,
+    open_browser: bool = True,
+    timeout: int = 300,
+) -> int:
     token_path = Path(token_file) if token_file else _runtime_dir() / "token.txt"
     if not token_path.is_file():
         print(f"API token file not found: {token_path}", file=sys.stderr)

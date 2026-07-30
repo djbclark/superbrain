@@ -55,8 +55,13 @@ superbrain --sync-category-playlists      # backfill all YouTube analyses
 superbrain --sync-category-playlists --sync-category-playlists-limit 20
 ```
 
-`superbrain --sync-category-playlists` reloads SecretSpec when needed and
-skips videos already synced (safe to resume after quota/interrupt).
+`superbrain --sync-category-playlists` reloads SecretSpec when needed,
+skips videos already synced, and **waits for the Pacific-midnight YouTube
+quota reset** on 403/quota errors before continuing.
+
+Concurrent accidental runs are blocked with exclusive flock locks under
+`~/.superbrain-server/locks/` for `--youtube-connect`,
+`--sync-category-playlists`, and `--category-playlists-status`.
 
 ## API
 

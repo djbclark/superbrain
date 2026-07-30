@@ -352,10 +352,14 @@ def sync_video_category(
     content_type: str = "youtube",
     config: Optional[PlaylistSyncConfig] = None,
     client: Optional[YouTubePlaylistClient] = None,
+    ensure_playlists: bool = True,
 ) -> dict[str, Any]:
     """
     Move a YouTube video into the playlist for new_category.
     Idempotent: re-running with the same category is a no-op.
+
+    Set ensure_playlists=False during bulk backfill after a single ensure pass
+    so we do not re-list YouTube playlists (and burn quota) on every video.
     """
     cfg = config or load_playlist_sync_config()
     result: dict[str, Any] = {
@@ -421,23 +425,25 @@ def sync_video_category(
             result["skipped"] = result["skipped"] or "no_target_category"
         return result
 
-    # Ensure destination playlist mapping exists.
-    ensure = ensure_category_playlists(db, config=cfg, taxonomy=tax, client=yt)
     mapped = db.get_category_youtube_playlist(resolved)
-    if cfg.dry_run and not mapped:
-        # Dry-run ensure does not persist; synthesize from ensure actions.
-        for act in ensure.get("actions", []):
-            if act.get("category") == resolved:
-                mapped = {
-                    "category_name": resolved,
-                    "playlist_id": act.get("playlist_id"),
-                    "title": act.get("title"),
-                }
-                break
+    ensure = None
+    if (not mapped or not mapped.get("playlist_id")) and ensure_playlists:
+        ensure = ensure_category_playlists(db, config=cfg, taxonomy=tax, client=yt)
+        mapped = db.get_category_youtube_playlist(resolved)
+        if cfg.dry_run and not mapped:
+            for act in ensure.get("actions", []):
+                if act.get("category") == resolved:
+                    mapped = {
+                        "category_name": resolved,
+                        "playlist_id": act.get("playlist_id"),
+                        "title": act.get("title"),
+                    }
+                    break
     if not mapped or not mapped.get("playlist_id"):
         result["ok"] = False
         result["skipped"] = "playlist_missing"
-        result["ensure"] = ensure
+        if ensure is not None:
+            result["ensure"] = ensure
         return result
 
     playlist_id = mapped["playlist_id"]
@@ -568,121 +574,218 @@ def ensure_runtime_env_for_cli(*, entrypoint: Path) -> None:
     )
 
 
+def is_youtube_quota_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    if "403" in text or "429" in text:
+        return True
+    markers = (
+        "quota",
+        "ratelimit",
+        "rate limit",
+        "rate_limit",
+        "dailylimit",
+        "daily limit",
+        "usageratelimit",
+        "forbidden",
+    )
+    return any(m in text for m in markers)
+
+
+def seconds_until_youtube_quota_reset(*, now=None) -> float:
+    """YouTube Data API daily quotas reset at midnight Pacific Time."""
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        pacific = ZoneInfo("America/Los_Angeles")
+    except Exception:
+        pacific = timezone.utc
+    current = now or datetime.now(pacific)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=pacific)
+    else:
+        current = current.astimezone(pacific)
+    nxt = (current + timedelta(days=1)).replace(
+        hour=0, minute=2, second=0, microsecond=0
+    )
+    return max(60.0, (nxt - current).total_seconds())
+
+
+def sleep_until_youtube_quota_reset() -> None:
+    import time
+
+    secs = seconds_until_youtube_quota_reset()
+    hours = secs / 3600.0
+    print(
+        f"YouTube API quota exhausted; sleeping {hours:.1f}h until Pacific midnight reset…",
+        flush=True,
+    )
+    deadline = time.monotonic() + secs
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(300.0, remaining))
+        left_h = max(0.0, (deadline - time.monotonic()) / 3600.0)
+        if left_h > 0:
+            print(f"  …still waiting for quota reset ({left_h:.1f}h left)", flush=True)
+
+
 def print_category_playlists_status() -> int:
     import json
+    import sys
 
+    from core.cli_locks import CliLockUnavailable, exclusive_cli_lock
     from core.database import Database
     from core.taxonomy import get_taxonomy
 
-    cfg = load_playlist_sync_config()
-    db = Database()
-    tax = get_taxonomy(cfg.config_path) if cfg.config_path else get_taxonomy()
-    print(
-        json.dumps(
-            {
-                "config": {
-                    "enabled": cfg.enabled,
-                    "dry_run": cfg.dry_run,
-                    "title_prefix": cfg.title_prefix,
-                    "privacy_status": cfg.privacy_status,
-                    "categories": list(cfg.categories) if cfg.categories else tax.names,
-                },
-                "mappings": db.list_category_youtube_playlists(),
-                "synced_items": db._conn.execute(
-                    "select count(*) from category_youtube_playlist_items"
-                ).fetchone()[0],
-                "oauth_refresh_token_set": bool(
-                    os.getenv("YOUTUBE_OAUTH_REFRESH_TOKEN")
-                ),
-            },
-            indent=2,
-        )
-    )
-    return 0
+    try:
+        with exclusive_cli_lock("category-playlists-status"):
+            cfg = load_playlist_sync_config()
+            db = Database()
+            tax = get_taxonomy(cfg.config_path) if cfg.config_path else get_taxonomy()
+            print(
+                json.dumps(
+                    {
+                        "config": {
+                            "enabled": cfg.enabled,
+                            "dry_run": cfg.dry_run,
+                            "title_prefix": cfg.title_prefix,
+                            "privacy_status": cfg.privacy_status,
+                            "categories": list(cfg.categories)
+                            if cfg.categories
+                            else tax.names,
+                        },
+                        "mappings": db.list_category_youtube_playlists(),
+                        "synced_items": db._conn.execute(
+                            "select count(*) from category_youtube_playlist_items"
+                        ).fetchone()[0],
+                        "oauth_refresh_token_set": bool(
+                            os.getenv("YOUTUBE_OAUTH_REFRESH_TOKEN")
+                        ),
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+    except CliLockUnavailable as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
 
 
 def backfill_category_playlists(
     *,
     limit: int = 0,
     continue_on_error: bool = True,
+    wait_for_quota: bool = True,
 ) -> int:
     """Backfill YouTube analyses into category playlists (CLI entrypoint)."""
     import json
     import sys
 
+    from core.cli_locks import CliLockUnavailable, exclusive_cli_lock
     from core.database import Database
 
-    cfg = load_playlist_sync_config()
-    if not cfg.enabled:
-        print(
-            "disabled: run superbrain --youtube-connect first "
-            "(or set [youtube_playlists] enabled=true)",
-            file=sys.stderr,
-        )
-        return 2
-    db = Database()
-    ensure = ensure_category_playlists(db, config=cfg)
-    rows = db._conn.execute(
-        """
-        SELECT shortcode, url, category, content_type, COALESCE(is_hidden, 0) AS is_hidden
-        FROM analyses
-        WHERE content_type = 'youtube'
-          AND COALESCE(is_hidden, 0) = 0
-          AND category IS NOT NULL
-          AND category != ''
-        ORDER BY categorized_at DESC, updated_at DESC
-        """
-    ).fetchall()
-    if limit and limit > 0:
-        rows = rows[:limit]
+    try:
+        with exclusive_cli_lock("sync-category-playlists"):
+            cfg = load_playlist_sync_config()
+            if not cfg.enabled:
+                print(
+                    "disabled: run superbrain --youtube-connect first "
+                    "(or set [youtube_playlists] enabled=true)",
+                    file=sys.stderr,
+                )
+                return 2
+            db = Database()
 
-    ok = skipped = failed = 0
-    for index, row in enumerate(rows, 1):
-        rec = dict(row)
-        try:
-            out = sync_video_category(
-                db,
-                shortcode=rec["shortcode"],
-                url=rec.get("url") or "",
-                new_category=rec.get("category"),
-                is_hidden=bool(rec.get("is_hidden")),
-                content_type=rec.get("content_type") or "youtube",
-                config=cfg,
-            )
-            if out.get("skipped"):
-                skipped += 1
-            elif out.get("ok"):
-                ok += 1
-            else:
-                failed += 1
-        except Exception as exc:
-            failed += 1
+            while True:
+                try:
+                    ensure = ensure_category_playlists(db, config=cfg)
+                    break
+                except Exception as exc:
+                    if wait_for_quota and is_youtube_quota_error(exc):
+                        sleep_until_youtube_quota_reset()
+                        continue
+                    raise
+
+            rows = db._conn.execute(
+                """
+                SELECT shortcode, url, category, content_type,
+                       COALESCE(is_hidden, 0) AS is_hidden
+                FROM analyses
+                WHERE content_type = 'youtube'
+                  AND COALESCE(is_hidden, 0) = 0
+                  AND category IS NOT NULL
+                  AND category != ''
+                ORDER BY categorized_at DESC, updated_at DESC
+                """
+            ).fetchall()
+            if limit and limit > 0:
+                rows = rows[:limit]
+
+            ok = skipped = failed = 0
+            index = 0
+            while index < len(rows):
+                rec = dict(rows[index])
+                index += 1
+                try:
+                    out = sync_video_category(
+                        db,
+                        shortcode=rec["shortcode"],
+                        url=rec.get("url") or "",
+                        new_category=rec.get("category"),
+                        is_hidden=bool(rec.get("is_hidden")),
+                        content_type=rec.get("content_type") or "youtube",
+                        config=cfg,
+                        ensure_playlists=False,
+                    )
+                    if out.get("skipped"):
+                        skipped += 1
+                    elif out.get("ok"):
+                        ok += 1
+                    else:
+                        failed += 1
+                except Exception as exc:
+                    if wait_for_quota and is_youtube_quota_error(exc):
+                        print(
+                            f"[{index}/{len(rows)}] quota hit on {rec['shortcode']}; "
+                            "will retry after reset",
+                            flush=True,
+                        )
+                        sleep_until_youtube_quota_reset()
+                        index -= 1
+                        continue
+                    failed += 1
+                    print(
+                        f"[{index}/{len(rows)}] ERROR {rec['shortcode']}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    if not continue_on_error:
+                        break
+                if index == 1 or index % 25 == 0 or index == len(rows):
+                    print(
+                        f"[{index}/{len(rows)}] ok={ok} skipped={skipped} "
+                        f"failed={failed} last={rec['shortcode']}",
+                        flush=True,
+                    )
             print(
-                f"[{index}/{len(rows)}] ERROR {rec['shortcode']}: {exc}",
-                file=sys.stderr,
-                flush=True,
+                json.dumps(
+                    {
+                        "ensure": ensure,
+                        "summary": {
+                            "ok": ok,
+                            "skipped": skipped,
+                            "failed": failed,
+                            "total": len(rows),
+                        },
+                    },
+                    indent=2,
+                )
             )
-            if not continue_on_error:
-                break
-        if index == 1 or index % 25 == 0 or index == len(rows):
-            print(
-                f"[{index}/{len(rows)}] ok={ok} skipped={skipped} failed={failed} "
-                f"last={rec['shortcode']}",
-                flush=True,
-            )
-    print(
-        json.dumps(
-            {
-                "ensure": ensure,
-                "summary": {
-                    "ok": ok,
-                    "skipped": skipped,
-                    "failed": failed,
-                    "total": len(rows),
-                },
-            },
-            indent=2,
-        )
-    )
-    return 0 if failed == 0 else 1
+            return 0 if failed == 0 else 1
+    except CliLockUnavailable as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
 
