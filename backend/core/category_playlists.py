@@ -93,6 +93,72 @@ def load_playlist_sync_config(path: Optional[Path] = None) -> PlaylistSyncConfig
     )
 
 
+_SECTION_RE = re.compile(
+    r"(?ms)^\[youtube_playlists\]\s*\n.*?(?=^\[|\Z)"
+)
+
+
+def enable_playlist_sync_in_config(
+    path: Optional[Path] = None,
+    *,
+    dry_run: bool = False,
+) -> PlaylistSyncConfig:
+    """
+    Write enabled playlist sync into categories.toml (no hand-editing required).
+
+    Preserves title_prefix, privacy_status, and optional category subset when
+    already present. Creates the section if missing.
+    """
+    config_path = Path(path) if path else Path(
+        os.environ.get("SUPERBRAIN_CATEGORIES_CONFIG", str(DEFAULT_CONFIG_PATH))
+    )
+    existing = load_playlist_sync_config(config_path)
+    title_prefix = existing.title_prefix or "SuperBrain — "
+    privacy = existing.privacy_status or "private"
+    lines = [
+        "[youtube_playlists]",
+        "enabled = true",
+        f"dry_run = {'true' if dry_run else 'false'}",
+        f'title_prefix = "{title_prefix}"',
+        f'privacy_status = "{privacy}"',
+    ]
+    if existing.categories:
+        cats = ", ".join(f'"{c}"' for c in existing.categories)
+        lines.append(f"categories = [{cats}]")
+    section = "\n".join(lines) + "\n"
+
+    if config_path.is_file():
+        text = config_path.read_text(encoding="utf-8")
+        if _SECTION_RE.search(text):
+            text = _SECTION_RE.sub(section, text, count=1)
+        else:
+            text = text.rstrip() + "\n\n" + section
+    else:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        text = section
+
+    config_path.write_text(text, encoding="utf-8")
+    logger.info(
+        "Enabled [youtube_playlists] in %s (dry_run=%s)",
+        config_path,
+        dry_run,
+    )
+    return load_playlist_sync_config(config_path)
+
+
+def activate_after_oauth(db) -> dict[str, Any]:
+    """Enable playlist sync in config and ensure category playlists exist."""
+    cfg = enable_playlist_sync_in_config(dry_run=False)
+    ensure = ensure_category_playlists(db, config=cfg)
+    return {"config": {
+        "enabled": cfg.enabled,
+        "dry_run": cfg.dry_run,
+        "title_prefix": cfg.title_prefix,
+        "privacy_status": cfg.privacy_status,
+        "config_path": str(cfg.config_path) if cfg.config_path else None,
+    }, "ensure": ensure}
+
+
 def extract_youtube_video_id(shortcode: str = "", url: str = "") -> Optional[str]:
     """Derive an 11-char YouTube video id from YT_* shortcode or watch URL."""
     if shortcode:

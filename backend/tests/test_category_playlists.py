@@ -176,6 +176,24 @@ class TestPlaylistSync(unittest.TestCase):
         client.create_playlist.assert_not_called()
         client.add_video.assert_not_called()
 
+    def test_enable_playlist_sync_in_config(self):
+        from core.category_playlists import enable_playlist_sync_in_config
+
+        # Start from disabled section
+        self.cfg_path.write_text(
+            TOML.replace("enabled = true", "enabled = false").replace(
+                "dry_run = false", "dry_run = true"
+            ),
+            encoding="utf-8",
+        )
+        cfg = enable_playlist_sync_in_config(self.cfg_path, dry_run=False)
+        self.assertTrue(cfg.enabled)
+        self.assertFalse(cfg.dry_run)
+        text = self.cfg_path.read_text(encoding="utf-8")
+        self.assertIn("enabled = true", text)
+        self.assertIn("dry_run = false", text)
+        self.assertIn('title_prefix = "SB — "', text)
+
 
 if __name__ == "__main__":
     unittest.main()

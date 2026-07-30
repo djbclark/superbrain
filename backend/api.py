@@ -15,6 +15,7 @@ import asyncio
 import sys
 import os
 import json
+import html
 import zipfile
 import io
 import hashlib
@@ -2580,21 +2581,48 @@ async def youtube_oauth_callback(code: str = "", state: str = "", error: str = "
     if not code or not pending or pending[1] < time.monotonic():
         raise HTTPException(status_code=400, detail="OAuth state is missing or expired; start authorization again")
     from core import youtube_oauth
+    from core.category_playlists import activate_after_oauth
     tokens = await asyncio.to_thread(youtube_oauth.exchange_code, code, _YOUTUBE_OAUTH_REDIRECT_URI, pending[0])
     refresh_token = tokens.get("refresh_token")
     if not refresh_token:
         raise HTTPException(status_code=400, detail="Google did not return a refresh token; revoke access and retry")
     await asyncio.to_thread(youtube_oauth.persist_refresh_token, refresh_token)
-    html = """<!DOCTYPE html>
+
+    playlist_note = "Category playlist sync is on; new YouTube analyses will join their category playlist."
+    ensure_note = ""
+    try:
+        activated = await asyncio.to_thread(activate_after_oauth, get_db())
+        actions = (activated.get("ensure") or {}).get("actions") or []
+        created = sum(1 for a in actions if a.get("action") in {"created", "would_create"})
+        adopted = sum(1 for a in actions if a.get("action") == "adopted")
+        mapped = sum(1 for a in actions if a.get("action") == "mapped")
+        ensure_note = (
+            f"<p>Category playlists ready: {created} created, {adopted} adopted, "
+            f"{mapped} already mapped.</p>"
+            "<p>Optional backfill of existing videos: "
+            "<code>python scripts/sync_category_playlists.py sync-all</code> "
+            "from the runtime.</p>"
+        )
+    except Exception as exc:
+        logger.warning("Enabled playlist sync config but ensure failed: %s", exc)
+        safe = html.escape(str(exc))
+        playlist_note = (
+            "Category playlist sync was enabled in config, but creating playlists "
+            f"failed ({safe}). Re-run <code>superbrain --youtube-connect</code> "
+            "or call the ensure API after fixing access."
+        )
+
+    html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>YouTube connected</title>
 <style>
-body{font-family:system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;line-height:1.5}
-code{background:#f4f4f4;padding:.1rem .35rem;border-radius:4px}
+body{{font-family:system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;line-height:1.5}}
+code{{background:#f4f4f4;padding:.1rem .35rem;border-radius:4px}}
 </style></head><body>
 <h1>YouTube connected</h1>
 <p>SuperBrain stored a new refresh token (playlist-capable scope).</p>
-<p>You can close this tab. Next: enable <code>[youtube_playlists]</code> in
-<code>categories.toml</code> when you are ready to sync.</p>
+<p>{playlist_note}</p>
+{ensure_note}
+<p>You can close this tab.</p>
 </body></html>"""
     return Response(html, media_type="text/html")
 

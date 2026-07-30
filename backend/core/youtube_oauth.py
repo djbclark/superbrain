@@ -205,6 +205,17 @@ def run_local_browser_connect(
             ):
                 print("YouTube connected.")
                 print(f"  scope: {payload.get('oauth_scope')}")
+                # Callback enables [youtube_playlists] automatically; confirm.
+                playlists = payload.get("category_playlists") or {}
+                if playlists.get("enabled") and not playlists.get("dry_run"):
+                    print("  category playlist sync: enabled")
+                elif playlists.get("enabled"):
+                    print("  category playlist sync: enabled (dry_run)")
+                else:
+                    print(
+                        "  category playlist sync: not enabled yet "
+                        "(callback may still be finishing — check status)"
+                    )
                 return 0
         time.sleep(2)
 

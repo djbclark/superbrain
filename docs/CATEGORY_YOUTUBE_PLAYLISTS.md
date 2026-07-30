@@ -20,14 +20,15 @@ playlist membership in sync when a video’s category is assigned or changed.
    callback. Equivalently, open
    `http://127.0.0.1:5000/api/youtube/oauth/start?token=<token-from-token.txt>`
    in a browser on this machine.
-3. Opt in via `[youtube_playlists]` in `categories.toml` (never committed).
-
-## Config
+3. Playlist sync turns on automatically after a successful
+   `superbrain --youtube-connect` (writes `enabled=true` / `dry_run=false`
+   into live `categories.toml` and creates/adopts category playlists).
+   You can still override settings by hand if needed:
 
 ```toml
 [youtube_playlists]
-enabled = false          # master switch
-dry_run = true           # log would_create / would_add; no YouTube writes
+enabled = true
+dry_run = false
 title_prefix = "SuperBrain — "
 privacy_status = "private"
 # categories = ["Sysadmin", "Science"]   # optional subset; omit = all taxonomy
@@ -71,7 +72,6 @@ All require the API key. Ensure/sync require `enabled=true`.
 ## Rollout checklist
 
 1. Deploy code; restart LaunchAgent when the queue is in a safe state.
-2. Re-authorize YouTube OAuth (new scope).
-3. Set `enabled = true`, keep `dry_run = true`; run `ensure` + a small `sync-all --limit`.
-4. Review dry-run actions; set `dry_run = false`; `ensure` then backfill.
-5. New analyses and manual category edits sync automatically while enabled.
+2. Run `superbrain --youtube-connect` (re-authorize + auto-enable playlist sync + ensure playlists).
+3. New YouTube analyses and manual category edits sync going forward.
+4. Optional: backfill history with `python scripts/sync_category_playlists.py sync-all`.
