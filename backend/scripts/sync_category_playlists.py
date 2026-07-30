@@ -118,7 +118,7 @@ def cmd_sync_all(args) -> int:
     ok = 0
     failed = 0
     skipped = 0
-    for row in rows:
+    for index, row in enumerate(rows, 1):
         rec = dict(row)
         try:
             out = sync_video_category(
@@ -130,7 +130,8 @@ def cmd_sync_all(args) -> int:
                 content_type=rec.get("content_type") or "youtube",
                 config=cfg,
             )
-            results.append(out)
+            if args.verbose:
+                results.append(out)
             if out.get("skipped"):
                 skipped += 1
             elif out.get("ok"):
@@ -139,9 +140,22 @@ def cmd_sync_all(args) -> int:
                 failed += 1
         except Exception as exc:
             failed += 1
-            results.append({"shortcode": rec["shortcode"], "ok": False, "error": str(exc)})
+            err = {"shortcode": rec["shortcode"], "ok": False, "error": str(exc)}
+            if args.verbose:
+                results.append(err)
+            print(
+                f"[{index}/{len(rows)}] ERROR {rec['shortcode']}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
             if not args.continue_on_error:
                 break
+        if index == 1 or index % 25 == 0 or index == len(rows):
+            print(
+                f"[{index}/{len(rows)}] ok={ok} skipped={skipped} failed={failed} "
+                f"last={rec['shortcode']}",
+                flush=True,
+            )
     print(
         json.dumps(
             {
