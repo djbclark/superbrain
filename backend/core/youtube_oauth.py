@@ -1,4 +1,4 @@
-"""Minimal OAuth helpers for private YouTube subscription discovery."""
+"""Minimal OAuth helpers for YouTube subscription discovery and playlist sync."""
 from __future__ import annotations
 
 import base64
@@ -15,7 +15,9 @@ import requests
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 SUBSCRIPTIONS_URL = "https://www.googleapis.com/youtube/v3/subscriptions"
-SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+# Full YouTube scope covers subscriptions (readonly) and playlist create/modify.
+# Changing SCOPE requires re-authorization so Google issues a new refresh token.
+SCOPE = "https://www.googleapis.com/auth/youtube"
 
 
 def configured() -> bool:

@@ -59,3 +59,8 @@ UI without touching live.
 See `backend/scripts/test-env.sh promote-plan`. Important: copy **code +
 categories.toml + recategorize live metadata** — do **not** replace the live
 database with the tiny seeded test DB.
+
+As of 2026-07-30 the standalone test runtime was torn down; production is only
+`~/.superbrain-server` (LaunchAgent `com.djbclark.superbrain`, port 5000).
+Recategorize audit reports from the test env were preserved under
+`~/.superbrain-server/reports/from-test-env/`.

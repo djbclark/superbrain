@@ -1351,10 +1351,24 @@ async def update_post(shortcode: str, updates: dict, token: str = Depends(verify
         if not filtered_updates:
             raise HTTPException(status_code=400, detail="No valid fields to update")
 
+        existing = db.get_by_shortcode(shortcode)
+        old_category = (existing or {}).get("category") if existing else None
         result = db.update_post(shortcode, filtered_updates)
 
         if result:
             logger.info(f"✅ Updated post: {shortcode} - {list(filtered_updates.keys())}")
+            if "category" in filtered_updates and existing:
+                from core.category_playlists import maybe_sync_after_category_change
+
+                maybe_sync_after_category_change(
+                    db,
+                    shortcode=shortcode,
+                    url=existing.get("url") or "",
+                    new_category=filtered_updates.get("category"),
+                    old_category=old_category,
+                    is_hidden=bool(existing.get("is_hidden")),
+                    content_type=existing.get("content_type") or "youtube",
+                )
             return {
                 "success": True,
                 "message": "Post updated successfully",
@@ -2517,10 +2531,20 @@ _YOUTUBE_OAUTH_REDIRECT_URI = "http://localhost:5000/api/youtube/oauth/callback"
 @app.get("/api/youtube/oauth/status")
 async def youtube_oauth_status(token: str = Depends(verify_token)):
     from core import youtube_oauth
+    from core.category_playlists import load_playlist_sync_config
+
+    sync_cfg = load_playlist_sync_config()
     return {
         "configured": youtube_oauth.configured(),
         "authorized": bool(os.getenv("YOUTUBE_OAUTH_REFRESH_TOKEN")),
         "redirect_uri": _YOUTUBE_OAUTH_REDIRECT_URI,
+        "oauth_scope": youtube_oauth.SCOPE,
+        "category_playlists": {
+            "enabled": sync_cfg.enabled,
+            "dry_run": sync_cfg.dry_run,
+            "title_prefix": sync_cfg.title_prefix,
+            "privacy_status": sync_cfg.privacy_status,
+        },
     }
 
 
@@ -2556,6 +2580,77 @@ async def discover_youtube_subscriptions(token: str = Depends(verify_token)):
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Could not fetch YouTube subscriptions; authorize again if testing credentials have expired") from exc
     return {"count": len(channels), "channels": channels}
+
+
+@app.get("/api/youtube/category-playlists/status")
+async def category_playlists_status(token: str = Depends(verify_token)):
+    """Show category→playlist mapping and sync config (no YouTube mutations)."""
+    from core.category_playlists import load_playlist_sync_config
+    from core.taxonomy import get_taxonomy
+
+    db = get_db()
+    cfg = load_playlist_sync_config()
+    tax = get_taxonomy()
+    return {
+        "config": {
+            "enabled": cfg.enabled,
+            "dry_run": cfg.dry_run,
+            "title_prefix": cfg.title_prefix,
+            "privacy_status": cfg.privacy_status,
+            "categories": list(cfg.categories) if cfg.categories else tax.names,
+        },
+        "mappings": db.list_category_youtube_playlists(),
+    }
+
+
+@app.post("/api/youtube/category-playlists/ensure")
+async def category_playlists_ensure(token: str = Depends(verify_token)):
+    """Create or adopt YouTube playlists for configured taxonomy categories."""
+    from core.category_playlists import ensure_category_playlists, load_playlist_sync_config
+
+    cfg = load_playlist_sync_config()
+    if not cfg.enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="Category playlists disabled; set [youtube_playlists] enabled=true in categories.toml",
+        )
+    try:
+        return await asyncio.to_thread(ensure_category_playlists, get_db(), config=cfg)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Playlist ensure failed; re-authorize YouTube OAuth if the refresh token lacks playlist scope",
+        ) from exc
+
+
+@app.post("/api/youtube/category-playlists/sync/{shortcode}")
+async def category_playlists_sync_one(shortcode: str, token: str = Depends(verify_token)):
+    """Sync one analysis into its category YouTube playlist."""
+    from core.category_playlists import load_playlist_sync_config, sync_video_category
+
+    cfg = load_playlist_sync_config()
+    if not cfg.enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="Category playlists disabled; set [youtube_playlists] enabled=true in categories.toml",
+        )
+    db = get_db()
+    row = db.get_by_shortcode(shortcode)
+    if not row:
+        raise HTTPException(status_code=404, detail="Post not found")
+    try:
+        return await asyncio.to_thread(
+            sync_video_category,
+            db,
+            shortcode=shortcode,
+            url=row.get("url") or "",
+            new_category=row.get("category"),
+            is_hidden=bool(row.get("is_hidden")),
+            content_type=row.get("content_type") or "youtube",
+            config=cfg,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Playlist sync failed: {exc}") from exc
 
 
 if __name__ == "__main__":

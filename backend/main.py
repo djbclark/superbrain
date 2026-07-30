@@ -540,6 +540,18 @@ def run_youtube_analysis(
         print(f"❌ YouTube analysis completed but could not be persisted ({shortcode})")
         return
     print(f"✓ YouTube analysis saved ({shortcode})")
+    try:
+        from core.category_playlists import maybe_sync_after_category_change
+
+        maybe_sync_after_category_change(
+            db,
+            shortcode=shortcode,
+            url=url,
+            new_category=category,
+            content_type="youtube",
+        )
+    except Exception as sync_exc:
+        print(f"[WARNING] Category playlist sync skipped: {sync_exc}")
     print_header("✅ Done — YouTube Analysis Complete")
     return True
 

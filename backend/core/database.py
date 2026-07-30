@@ -268,6 +268,30 @@ class Database:
         """)
         self._conn.commit()
 
+        # YouTube playlists mirrored from configured taxonomy categories
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS category_youtube_playlists (
+                category_name TEXT PRIMARY KEY,
+                playlist_id   TEXT NOT NULL UNIQUE,
+                title         TEXT NOT NULL,
+                created_at    TEXT,
+                updated_at    TEXT
+            );
+            CREATE TABLE IF NOT EXISTS category_youtube_playlist_items (
+                video_id          TEXT PRIMARY KEY,
+                shortcode         TEXT,
+                category_name     TEXT NOT NULL,
+                playlist_id       TEXT NOT NULL,
+                playlist_item_id  TEXT,
+                updated_at        TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_cat_yt_items_category
+                ON category_youtube_playlist_items (category_name);
+            CREATE INDEX IF NOT EXISTS idx_cat_yt_items_shortcode
+                ON category_youtube_playlist_items (shortcode);
+        """)
+        self._conn.commit()
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -1317,6 +1341,74 @@ class Database:
             (cutoff,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Category ↔ YouTube playlist mappings
+    # ------------------------------------------------------------------
+
+    def upsert_category_youtube_playlist(self, category_name, playlist_id, title):
+        now = _utcnow().isoformat()
+        self._conn.execute(
+            """
+            INSERT INTO category_youtube_playlists
+                (category_name, playlist_id, title, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(category_name) DO UPDATE SET
+                playlist_id = excluded.playlist_id,
+                title = excluded.title,
+                updated_at = excluded.updated_at
+            """,
+            (category_name, playlist_id, title, now, now),
+        )
+        self._conn.commit()
+
+    def get_category_youtube_playlist(self, category_name):
+        row = self._conn.execute(
+            "SELECT * FROM category_youtube_playlists WHERE category_name = ?",
+            (category_name,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_category_youtube_playlists(self):
+        rows = self._conn.execute(
+            "SELECT * FROM category_youtube_playlists ORDER BY category_name"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_category_youtube_playlist_item(self, video_id):
+        row = self._conn.execute(
+            "SELECT * FROM category_youtube_playlist_items WHERE video_id = ?",
+            (video_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_category_youtube_playlist_item(
+        self, *, video_id, shortcode, category_name, playlist_id, playlist_item_id
+    ):
+        now = _utcnow().isoformat()
+        self._conn.execute(
+            """
+            INSERT INTO category_youtube_playlist_items
+                (video_id, shortcode, category_name, playlist_id, playlist_item_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(video_id) DO UPDATE SET
+                shortcode = excluded.shortcode,
+                category_name = excluded.category_name,
+                playlist_id = excluded.playlist_id,
+                playlist_item_id = excluded.playlist_item_id,
+                updated_at = excluded.updated_at
+            """,
+            (video_id, shortcode, category_name, playlist_id, playlist_item_id, now),
+        )
+        self._conn.commit()
+
+    def delete_category_youtube_playlist_item(self, video_id):
+        cur = self._conn.execute(
+            "DELETE FROM category_youtube_playlist_items WHERE video_id = ?",
+            (video_id,),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
 
 
 # ------------------------------------------------------------------

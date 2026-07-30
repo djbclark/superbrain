@@ -46,3 +46,15 @@ guidance = "Political news, policy, government, elections, and civic affairs."
 name = "Other"
 precedence = 7
 guidance = "Content that does not fit the categories above. Prefer a specific category when evidence supports one."
+
+# Optional: mirror taxonomy categories onto YouTube playlists (opt-in).
+# Requires YouTube OAuth with the full `youtube` scope (re-authorize after
+# upgrading from youtube.readonly). Mutations stay off until enabled=true
+# and dry_run=false. See docs/CATEGORY_YOUTUBE_PLAYLISTS.md.
+[youtube_playlists]
+enabled = false
+dry_run = true
+title_prefix = "SuperBrain — "
+privacy_status = "private"
+# Leave empty / omit to sync all configured taxonomy categories.
+# categories = ["Sysadmin", "Science", "Technology", "History", "Humanities", "Politics", "Other"]
