@@ -2067,11 +2067,15 @@ WEBSUB_RENEW_INTERVAL_SECONDS = int(
     os.getenv("WEBSUB_RENEW_INTERVAL_SECONDS", str(6 * 60 * 60))
 )
 WEBSUB_RECONCILE_INTERVAL_SECONDS = int(
-    os.getenv("WEBSUB_RECONCILE_INTERVAL_SECONDS", str(10 * 60))
+    os.getenv("WEBSUB_RECONCILE_INTERVAL_SECONDS", str(60 * 60))
+)
+WEBSUB_RECONCILE_IDLE_SECONDS = int(
+    os.getenv("WEBSUB_RECONCILE_IDLE_SECONDS", str(30 * 60))
 )
 WEBSUB_RECONCILE_MAX_WORKERS = int(
-    os.getenv("WEBSUB_RECONCILE_MAX_WORKERS", "8")
+    os.getenv("WEBSUB_RECONCILE_MAX_WORKERS", "4")
 )
+_websub_last_delivery_monotonic = time.monotonic()
 
 
 def _websub_secret() -> str:
@@ -2234,20 +2238,31 @@ async def _reconcile_websub_subscriptions_once():
 
 
 async def _websub_renewal_loop():
-    last_reconcile = 0.0
+    """Renew leases and reconcile feeds on independent, low-load schedules."""
+    last_renewal_check = 0.0
+    last_reconcile_check = 0.0
     while True:
-        try:
-            await _renew_websub_subscriptions_once()
-        except Exception as exc:
-            logger.warning("⚠️ [WebSub] Renewal pass failed: %s", exc)
         now = time.monotonic()
-        if now - last_reconcile >= WEBSUB_RECONCILE_INTERVAL_SECONDS:
+        if now - last_renewal_check >= WEBSUB_RENEW_INTERVAL_SECONDS:
             try:
-                await _reconcile_websub_subscriptions_once()
+                await _renew_websub_subscriptions_once()
             except Exception as exc:
-                logger.warning("⚠️ [WebSub] Feed reconciliation pass failed: %s", exc)
-            last_reconcile = time.monotonic()
-        await asyncio.sleep(min(WEBSUB_RENEW_INTERVAL_SECONDS, WEBSUB_RECONCILE_INTERVAL_SECONDS))
+                logger.warning("⚠️ [WebSub] Renewal pass failed: %s", exc)
+            last_renewal_check = time.monotonic()
+
+        if now - last_reconcile_check >= WEBSUB_RECONCILE_INTERVAL_SECONDS:
+            if now - _websub_last_delivery_monotonic >= WEBSUB_RECONCILE_IDLE_SECONDS:
+                try:
+                    await _reconcile_websub_subscriptions_once()
+                except Exception as exc:
+                    logger.warning("⚠️ [WebSub] Feed reconciliation pass failed: %s", exc)
+            else:
+                logger.info("[WebSub] Skipping reconciliation; the hub is delivering normally")
+            last_reconcile_check = time.monotonic()
+
+        next_renewal = last_renewal_check + WEBSUB_RENEW_INTERVAL_SECONDS
+        next_reconcile = last_reconcile_check + WEBSUB_RECONCILE_INTERVAL_SECONDS
+        await asyncio.sleep(max(1, min(next_renewal, next_reconcile) - time.monotonic()))
 
 
 @app.get("/api/youtube/webhook")
@@ -2319,6 +2334,8 @@ async def youtube_websub_notification(request: Request):
         logger.warning("Rejected WebSub notification with invalid signature")
         raise HTTPException(status_code=401, detail="Invalid WebSub signature")
 
+    global _websub_last_delivery_monotonic
+    _websub_last_delivery_monotonic = time.monotonic()
     logger.info("🔔 [WebSub] Received real-time YouTube upload push notification from Google Hub!")
     try:
         from core.websub_notifier import parse_websub_atom_payload
