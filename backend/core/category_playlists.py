@@ -536,3 +536,153 @@ def maybe_sync_after_category_change(
             )
     except Exception as exc:
         logger.warning("[category-playlists] sync failed for %s: %s", shortcode, exc)
+
+
+def ensure_runtime_env_for_cli(*, entrypoint: Path) -> None:
+    """Point CLI at the live runtime DB/config and load SecretSpec if needed."""
+    import sys
+
+    runtime = Path(
+        os.getenv(
+            "SUPERBRAIN_RUNTIME_DIR",
+            str(Path.home() / ".superbrain-server"),
+        )
+    )
+    os.environ.setdefault("SUPERBRAIN_RUNTIME_DIR", str(runtime))
+    os.environ.setdefault("DATABASE_PATH", str(runtime / "superbrain.db"))
+    os.environ.setdefault(
+        "SUPERBRAIN_CATEGORIES_CONFIG",
+        str(runtime / "config" / "categories.toml"),
+    )
+    if os.getenv("YOUTUBE_OAUTH_REFRESH_TOKEN") or os.getenv(
+        "SUPERBRAIN_SECRETSPEC_ACTIVE"
+    ):
+        return
+    runner = runtime / "scripts" / "run-with-secrets.sh"
+    if not runner.is_file():
+        return
+    os.environ["SUPERBRAIN_SECRETSPEC_ACTIVE"] = "1"
+    os.execv(
+        str(runner),
+        [str(runner), sys.executable, str(entrypoint.resolve()), *sys.argv[1:]],
+    )
+
+
+def print_category_playlists_status() -> int:
+    import json
+
+    from core.database import Database
+    from core.taxonomy import get_taxonomy
+
+    cfg = load_playlist_sync_config()
+    db = Database()
+    tax = get_taxonomy(cfg.config_path) if cfg.config_path else get_taxonomy()
+    print(
+        json.dumps(
+            {
+                "config": {
+                    "enabled": cfg.enabled,
+                    "dry_run": cfg.dry_run,
+                    "title_prefix": cfg.title_prefix,
+                    "privacy_status": cfg.privacy_status,
+                    "categories": list(cfg.categories) if cfg.categories else tax.names,
+                },
+                "mappings": db.list_category_youtube_playlists(),
+                "synced_items": db._conn.execute(
+                    "select count(*) from category_youtube_playlist_items"
+                ).fetchone()[0],
+                "oauth_refresh_token_set": bool(
+                    os.getenv("YOUTUBE_OAUTH_REFRESH_TOKEN")
+                ),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def backfill_category_playlists(
+    *,
+    limit: int = 0,
+    continue_on_error: bool = True,
+) -> int:
+    """Backfill YouTube analyses into category playlists (CLI entrypoint)."""
+    import json
+    import sys
+
+    from core.database import Database
+
+    cfg = load_playlist_sync_config()
+    if not cfg.enabled:
+        print(
+            "disabled: run superbrain --youtube-connect first "
+            "(or set [youtube_playlists] enabled=true)",
+            file=sys.stderr,
+        )
+        return 2
+    db = Database()
+    ensure = ensure_category_playlists(db, config=cfg)
+    rows = db._conn.execute(
+        """
+        SELECT shortcode, url, category, content_type, COALESCE(is_hidden, 0) AS is_hidden
+        FROM analyses
+        WHERE content_type = 'youtube'
+          AND COALESCE(is_hidden, 0) = 0
+          AND category IS NOT NULL
+          AND category != ''
+        ORDER BY categorized_at DESC, updated_at DESC
+        """
+    ).fetchall()
+    if limit and limit > 0:
+        rows = rows[:limit]
+
+    ok = skipped = failed = 0
+    for index, row in enumerate(rows, 1):
+        rec = dict(row)
+        try:
+            out = sync_video_category(
+                db,
+                shortcode=rec["shortcode"],
+                url=rec.get("url") or "",
+                new_category=rec.get("category"),
+                is_hidden=bool(rec.get("is_hidden")),
+                content_type=rec.get("content_type") or "youtube",
+                config=cfg,
+            )
+            if out.get("skipped"):
+                skipped += 1
+            elif out.get("ok"):
+                ok += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            failed += 1
+            print(
+                f"[{index}/{len(rows)}] ERROR {rec['shortcode']}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if not continue_on_error:
+                break
+        if index == 1 or index % 25 == 0 or index == len(rows):
+            print(
+                f"[{index}/{len(rows)}] ok={ok} skipped={skipped} failed={failed} "
+                f"last={rec['shortcode']}",
+                flush=True,
+            )
+    print(
+        json.dumps(
+            {
+                "ensure": ensure,
+                "summary": {
+                    "ok": ok,
+                    "skipped": skipped,
+                    "failed": failed,
+                    "total": len(rows),
+                },
+            },
+            indent=2,
+        )
+    )
+    return 0 if failed == 0 else 1
+

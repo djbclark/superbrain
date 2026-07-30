@@ -2600,8 +2600,7 @@ async def youtube_oauth_callback(code: str = "", state: str = "", error: str = "
             f"<p>Category playlists ready: {created} created, {adopted} adopted, "
             f"{mapped} already mapped.</p>"
             "<p>Optional backfill of existing videos: "
-            "<code>python scripts/sync_category_playlists.py sync-all</code> "
-            "from the runtime.</p>"
+            "<code>superbrain --sync-category-playlists</code>.</p>"
         )
     except Exception as exc:
         logger.warning("Enabled playlist sync config but ensure failed: %s", exc)

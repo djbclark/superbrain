@@ -46,17 +46,17 @@ privacy_status = "private"
 
 ## CLI
 
-From the runtime or checkout `backend/` (with secrets/env loaded as usual):
+With the local API/runtime available:
 
 ```bash
-python scripts/sync_category_playlists.py status
-python scripts/sync_category_playlists.py ensure --enable
-python scripts/sync_category_playlists.py sync-one YT_xxxxxxxxxxx --enable
-python scripts/sync_category_playlists.py sync-all --limit 20 --enable
-# Real YouTube writes (ignores dry_run for this process):
-python scripts/sync_category_playlists.py ensure --force-write
-python scripts/sync_category_playlists.py sync-all --force-write --continue-on-error
+superbrain --youtube-connect              # OAuth + auto-enable playlists
+superbrain --category-playlists-status    # config + mapping counts
+superbrain --sync-category-playlists      # backfill all YouTube analyses
+superbrain --sync-category-playlists --sync-category-playlists-limit 20
 ```
+
+`superbrain --sync-category-playlists` reloads SecretSpec when needed and
+skips videos already synced (safe to resume after quota/interrupt).
 
 ## API
 
@@ -74,4 +74,4 @@ All require the API key. Ensure/sync require `enabled=true`.
 1. Deploy code; restart LaunchAgent when the queue is in a safe state.
 2. Run `superbrain --youtube-connect` (re-authorize + auto-enable playlist sync + ensure playlists).
 3. New YouTube analyses and manual category edits sync going forward.
-4. Optional: backfill history with `python scripts/sync_category_playlists.py sync-all`.
+4. Optional: backfill history with `superbrain --sync-category-playlists`.

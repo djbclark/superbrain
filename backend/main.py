@@ -642,6 +642,22 @@ def main():
         action="store_true",
         help="Open Google OAuth in a browser to (re)authorize YouTube access, then exit",
     )
+    parser.add_argument(
+        "--sync-category-playlists",
+        action="store_true",
+        help="Backfill existing YouTube analyses into category playlists, then exit",
+    )
+    parser.add_argument(
+        "--category-playlists-status",
+        action="store_true",
+        help="Show category→playlist sync status, then exit",
+    )
+    parser.add_argument(
+        "--sync-category-playlists-limit",
+        type=int,
+        default=0,
+        help="With --sync-category-playlists, max videos to process (0 = all)",
+    )
 
     args = parser.parse_args()
 
@@ -649,6 +665,23 @@ def main():
         from core.youtube_oauth import run_local_browser_connect
 
         sys.exit(run_local_browser_connect())
+
+    if args.category_playlists_status or args.sync_category_playlists:
+        from core.category_playlists import (
+            backfill_category_playlists,
+            ensure_runtime_env_for_cli,
+            print_category_playlists_status,
+        )
+
+        ensure_runtime_env_for_cli(entrypoint=Path(__file__))
+        if args.category_playlists_status:
+            sys.exit(print_category_playlists_status())
+        sys.exit(
+            backfill_category_playlists(
+                limit=args.sync_category_playlists_limit,
+                continue_on_error=True,
+            )
+        )
 
     if args.start_index < 1:
         parser.error("--start-index must be at least 1")
