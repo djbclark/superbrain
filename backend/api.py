@@ -7,7 +7,7 @@ With request queuing, live progress logging, and API key authentication
 
 from fastapi import FastAPI, HTTPException, Query, Header, Depends, Request, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, RedirectResponse
 from pydantic import BaseModel
 from typing import Optional, List
 import subprocess
@@ -2398,6 +2398,56 @@ async def list_youtube_subscriptions(token: str = Depends(verify_token)):
     database = get_db()
     subs = database.list_websub_subscriptions()
     return {"count": len(subs), "subscriptions": subs}
+
+
+# OAuth is deliberately local-only: the Google desktop client redirects to this
+# loopback endpoint, while refresh tokens remain in SecretSpec rather than SQLite.
+_YOUTUBE_OAUTH_PENDING: dict[str, tuple[str, float]] = {}
+_YOUTUBE_OAUTH_REDIRECT_URI = "http://localhost:5000/api/youtube/oauth/callback"
+
+
+@app.get("/api/youtube/oauth/status")
+async def youtube_oauth_status(token: str = Depends(verify_token)):
+    from core import youtube_oauth
+    return {
+        "configured": youtube_oauth.configured(),
+        "authorized": bool(os.getenv("YOUTUBE_OAUTH_REFRESH_TOKEN")),
+        "redirect_uri": _YOUTUBE_OAUTH_REDIRECT_URI,
+    }
+
+
+@app.post("/api/youtube/oauth/start")
+async def youtube_oauth_start(token: str = Depends(verify_token)):
+    from core import youtube_oauth
+    state, verifier, challenge = youtube_oauth.new_pkce()
+    _YOUTUBE_OAUTH_PENDING[state] = (verifier, time.monotonic() + 600)
+    return {"authorization_url": youtube_oauth.authorization_url(_YOUTUBE_OAUTH_REDIRECT_URI, state, challenge)}
+
+
+@app.get("/api/youtube/oauth/callback")
+async def youtube_oauth_callback(code: str = "", state: str = "", error: str = ""):
+    pending = _YOUTUBE_OAUTH_PENDING.pop(state, None)
+    if error:
+        raise HTTPException(status_code=400, detail=f"Google authorization failed: {error}")
+    if not code or not pending or pending[1] < time.monotonic():
+        raise HTTPException(status_code=400, detail="OAuth state is missing or expired; start authorization again")
+    from core import youtube_oauth
+    tokens = await asyncio.to_thread(youtube_oauth.exchange_code, code, _YOUTUBE_OAUTH_REDIRECT_URI, pending[0])
+    refresh_token = tokens.get("refresh_token")
+    if not refresh_token:
+        raise HTTPException(status_code=400, detail="Google did not return a refresh token; revoke access and retry")
+    await asyncio.to_thread(youtube_oauth.persist_refresh_token, refresh_token)
+    return Response("YouTube connected. Return to SuperBrain and discover subscriptions.", media_type="text/plain")
+
+
+@app.post("/api/youtube/subscriptions/discover")
+async def discover_youtube_subscriptions(token: str = Depends(verify_token)):
+    from core import youtube_oauth
+    try:
+        channels = await asyncio.to_thread(youtube_oauth.list_subscriptions)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Could not fetch YouTube subscriptions; authorize again if testing credentials have expired") from exc
+    return {"count": len(channels), "channels": channels}
 
 
 if __name__ == "__main__":
