@@ -2539,10 +2539,8 @@ async def youtube_oauth_status(token: str = Depends(verify_token)):
         "authorized": bool(os.getenv("YOUTUBE_OAUTH_REFRESH_TOKEN")),
         "redirect_uri": _YOUTUBE_OAUTH_REDIRECT_URI,
         "oauth_scope": youtube_oauth.SCOPE,
-        "connect_hint": (
-            "Open /api/youtube/oauth/start?token=… in a browser on this machine, "
-            "or run: python scripts/youtube_oauth_connect.py"
-        ),
+        "last_connect_at": youtube_oauth.read_last_connect_at(),
+        "connect_hint": "Run: superbrain --youtube-connect",
         "category_playlists": {
             "enabled": sync_cfg.enabled,
             "dry_run": sync_cfg.dry_run,

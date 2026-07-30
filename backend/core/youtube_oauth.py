@@ -3,10 +3,17 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import secrets
 import subprocess
+import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -18,6 +25,34 @@ SUBSCRIPTIONS_URL = "https://www.googleapis.com/youtube/v3/subscriptions"
 # Full YouTube scope covers subscriptions (readonly) and playlist create/modify.
 # Changing SCOPE requires re-authorization so Google issues a new refresh token.
 SCOPE = "https://www.googleapis.com/auth/youtube"
+
+DEFAULT_API_BASE = "http://127.0.0.1:5000"
+
+
+def _runtime_dir() -> Path:
+    return Path(os.getenv("SUPERBRAIN_RUNTIME_DIR", str(Path.home() / ".superbrain-server")))
+
+
+def last_connect_stamp_path() -> Path:
+    return _runtime_dir() / "youtube_oauth.last_connect"
+
+
+def read_last_connect_at() -> str | None:
+    path = last_connect_stamp_path()
+    if not path.is_file():
+        return None
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def write_last_connect_at() -> str:
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    path = last_connect_stamp_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(stamp + "\n", encoding="utf-8")
+    return stamp
 
 
 def configured() -> bool:
@@ -74,6 +109,7 @@ def persist_refresh_token(token: str) -> None:
     if result.returncode:
         raise RuntimeError("Could not store YouTube OAuth refresh token in SecretSpec")
     os.environ["YOUTUBE_OAUTH_REFRESH_TOKEN"] = token
+    write_last_connect_at()
 
 
 def list_subscriptions() -> list[dict[str, str]]:
@@ -96,3 +132,81 @@ def list_subscriptions() -> list[dict[str, str]]:
         page_token = payload.get("nextPageToken", "")
         if not page_token:
             return items
+
+
+def _http_get_json(url: str) -> tuple[int, Any]:
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8")
+            ctype = resp.headers.get("Content-Type", "")
+            if "application/json" in ctype:
+                return resp.status, json.loads(body)
+            return resp.status, body
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            return exc.code, json.loads(body)
+        except Exception:
+            return exc.code, body
+
+
+def run_local_browser_connect(
+    *,
+    base_url: str = DEFAULT_API_BASE,
+    token_file: Path | None = None,
+    open_browser: bool = True,
+    timeout: int = 300,
+) -> int:
+    """
+    Open Google consent via the local API and wait for a fresh callback.
+
+    Used by `superbrain --youtube-connect`. Returns a process exit code.
+    """
+    token_path = Path(token_file) if token_file else _runtime_dir() / "token.txt"
+    if not token_path.is_file():
+        print(f"API token file not found: {token_path}", file=sys.stderr)
+        return 1
+    api_token = token_path.read_text(encoding="utf-8").strip()
+    base = base_url.rstrip("/")
+    q = urllib.parse.quote(api_token)
+    status_url = f"{base}/api/youtube/oauth/status?token={q}"
+    code, before = _http_get_json(status_url)
+    if code != 200 or not isinstance(before, dict):
+        print(f"Cannot reach API status ({code}): {before}", file=sys.stderr)
+        return 1
+    if not before.get("configured"):
+        print(
+            "YouTube OAuth client is not configured "
+            "(YOUTUBE_OAUTH_CLIENT_ID / SECRET missing in SecretSpec).",
+            file=sys.stderr,
+        )
+        return 1
+
+    before_stamp = before.get("last_connect_at") or read_last_connect_at()
+    connect_url = f"{base}/api/youtube/oauth/start?token={q}"
+    print("Opening Google consent in your browser…")
+    if open_browser:
+        webbrowser.open(connect_url)
+    else:
+        print(connect_url)
+
+    print("Complete consent in the browser; waiting for localhost callback…")
+    deadline = time.monotonic() + max(30, timeout)
+    while time.monotonic() < deadline:
+        code, payload = _http_get_json(status_url)
+        if code == 200 and isinstance(payload, dict) and payload.get("authorized"):
+            after_stamp = payload.get("last_connect_at") or read_last_connect_at()
+            # First-time auth: any authorized is enough.
+            # Re-auth: require a newer connect stamp so an old refresh token
+            # does not make us exit before the user finishes consent.
+            if not before.get("authorized") or (
+                after_stamp and after_stamp != before_stamp
+            ):
+                print("YouTube connected.")
+                print(f"  scope: {payload.get('oauth_scope')}")
+                return 0
+        time.sleep(2)
+
+    print("Timed out waiting for authorization. Try again.", file=sys.stderr)
+    return 1

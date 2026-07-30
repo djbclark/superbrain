@@ -637,8 +637,18 @@ def main():
     parser.add_argument("--all-at-once", action="store_true", default=False, help="Process all playlist items concurrently at once (5 workers)")
     parser.add_argument("-y", "--youtube-transcripts", action="store_true", default=False, help="Enable YouTube native transcript extraction")
     parser.add_argument("-m", "--transcribe-seconds", type=int, default=0, help="Duration of audio to transcribe in seconds (default: 0 = full video audio)")
+    parser.add_argument(
+        "--youtube-connect",
+        action="store_true",
+        help="Open Google OAuth in a browser to (re)authorize YouTube access, then exit",
+    )
 
     args = parser.parse_args()
+
+    if args.youtube_connect:
+        from core.youtube_oauth import run_local_browser_connect
+
+        sys.exit(run_local_browser_connect())
 
     if args.start_index < 1:
         parser.error("--start-index must be at least 1")

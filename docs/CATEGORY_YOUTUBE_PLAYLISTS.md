@@ -13,18 +13,13 @@ playlist membership in sync when a video’s category is assigned or changed.
    Easiest (local API running):
 
    ```bash
-   python ~/.superbrain-server/scripts/youtube_oauth_connect.py
-   # or from a checkout:
-   python backend/scripts/youtube_oauth_connect.py
+   superbrain --youtube-connect
    ```
 
    That opens Google consent in your browser and waits for the localhost
    callback. Equivalently, open
    `http://127.0.0.1:5000/api/youtube/oauth/start?token=<token-from-token.txt>`
    in a browser on this machine.
-
-   (`authorization_url` is just that Google consent link; you no longer need
-   to copy it out of a JSON response.)
 3. Opt in via `[youtube_playlists]` in `categories.toml` (never committed).
 
 ## Config
