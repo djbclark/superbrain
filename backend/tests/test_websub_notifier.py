@@ -22,6 +22,7 @@ from core.websub_notifier import (
     verify_websub_challenge,
     parse_websub_atom_payload,
     parse_opml_subscriptions,
+    parse_youtube_feed_entries,
     verify_websub_signature,
 )
 
@@ -89,6 +90,26 @@ class TestWebSubNotifier(unittest.TestCase):
         self.assertEqual(parsed["video_url"], "https://www.youtube.com/watch?v=Mqr2wO_Vap8")
         self.assertEqual(parsed["title"], "Test Video Title")
         self.assertEqual(parsed["channel_id"], "UC_x5XG1OV2P6uZZ5FSM9Ttw")
+
+    def test_parse_youtube_feed_entries(self):
+        feed_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom">
+          <entry>
+            <yt:videoId>Mqr2wO_Vap8</yt:videoId>
+            <yt:channelId>UC_x5XG1OV2P6uZZ5FSM9Ttw</yt:channelId>
+            <title>Test Video Title</title>
+            <published>2026-07-30T15:00:00+00:00</published>
+          </entry>
+        </feed>
+        """
+        entries = parse_youtube_feed_entries(feed_xml)
+        self.assertEqual(entries, [{
+            "video_id": "Mqr2wO_Vap8",
+            "video_url": "https://www.youtube.com/watch?v=Mqr2wO_Vap8",
+            "channel_id": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+            "title": "Test Video Title",
+            "published": "2026-07-30T15:00:00+00:00",
+        }])
 
     def test_parse_opml_subscriptions(self):
         """Test parsing YouTube subscription OPML export file."""

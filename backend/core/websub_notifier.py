@@ -195,6 +195,48 @@ def parse_opml_subscriptions(opml_data_or_path: str) -> List[Dict[str, str]]:
     return channels
 
 
+def parse_youtube_feed_entries(xml_content: str | bytes) -> List[Dict[str, str]]:
+    """Extract upload entries from a YouTube channel Atom feed."""
+    namespaces = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "yt": "http://www.youtube.com/xml/schemas/2015",
+    }
+    try:
+        root = ET.fromstring(xml_content)
+    except Exception as exc:
+        raise ValueError(f"Failed to parse YouTube Atom feed: {exc}") from exc
+
+    entries = []
+    for entry in root.findall("atom:entry", namespaces):
+        video_id = entry.findtext("yt:videoId", default="", namespaces=namespaces).strip()
+        channel_id = entry.findtext("yt:channelId", default="", namespaces=namespaces).strip()
+        title = entry.findtext("atom:title", default="", namespaces=namespaces).strip()
+        published = entry.findtext("atom:published", default="", namespaces=namespaces).strip()
+        if video_id:
+            entries.append({
+                "video_id": video_id,
+                "video_url": f"https://www.youtube.com/watch?v={video_id}",
+                "channel_id": channel_id,
+                "title": title,
+                "published": published,
+            })
+    return entries
+
+
+def fetch_youtube_feed_entries(channel_id: str, timeout: int = 15) -> List[Dict[str, str]]:
+    """Fetch one channel feed for the WebSub missed-delivery reconciliation."""
+    topic_url = build_topic_url(channel_id)
+    request = urllib.request.Request(
+        topic_url,
+        headers={"User-Agent": "SuperBrain-WebSub-Reconciler/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return parse_youtube_feed_entries(response.read())
+    except Exception as exc:
+        raise RuntimeError(f"Failed to fetch YouTube feed for {channel_id}: {exc}") from exc
+
+
 # ── Webhook Challenge Verification & Atom Payload Parser ──────────────────────
 
 def verify_websub_challenge(

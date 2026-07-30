@@ -2066,6 +2066,12 @@ WEBSUB_MAX_BODY_BYTES = int(os.getenv("WEBSUB_MAX_BODY_BYTES", str(1024 * 1024))
 WEBSUB_RENEW_INTERVAL_SECONDS = int(
     os.getenv("WEBSUB_RENEW_INTERVAL_SECONDS", str(6 * 60 * 60))
 )
+WEBSUB_RECONCILE_INTERVAL_SECONDS = int(
+    os.getenv("WEBSUB_RECONCILE_INTERVAL_SECONDS", str(15 * 60))
+)
+WEBSUB_RECONCILE_MAX_WORKERS = int(
+    os.getenv("WEBSUB_RECONCILE_MAX_WORKERS", "8")
+)
 
 
 def _websub_secret() -> str:
@@ -2156,13 +2162,92 @@ async def _renew_websub_subscriptions_once():
                 )
 
 
+def _parse_websub_timestamp(value: str):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+    except ValueError:
+        return None
+
+
+def _fetch_active_websub_feeds(subscriptions):
+    """Fetch active feeds concurrently without sharing SQLite connections."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from core.websub_notifier import fetch_youtube_feed_entries
+
+    results = []
+    if not subscriptions:
+        return results
+    worker_count = max(1, min(WEBSUB_RECONCILE_MAX_WORKERS, len(subscriptions)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(fetch_youtube_feed_entries, subscription["channel_id"]): subscription
+            for subscription in subscriptions
+        }
+        for future in as_completed(futures):
+            subscription = futures[future]
+            try:
+                results.append((subscription, future.result(), None))
+            except Exception as exc:
+                results.append((subscription, [], str(exc)))
+    return results
+
+
+async def _reconcile_websub_subscriptions_once():
+    """Queue uploads published after verification when the hub misses a push."""
+    database = get_db()
+    subscriptions = database.list_websub_subscriptions(status="active")
+    fetched = await asyncio.to_thread(_fetch_active_websub_feeds, subscriptions)
+    stats = {"channels": len(subscriptions), "fetched": 0, "failed": 0, "queued": 0}
+    for subscription, entries, error in fetched:
+        if error:
+            stats["failed"] += 1
+            logger.warning("[WebSub] Feed reconciliation failed for %s: %s", subscription["channel_id"], error)
+            continue
+        stats["fetched"] += 1
+        not_before = _parse_websub_timestamp(
+            subscription.get("verified_at") or subscription.get("subscribed_at") or ""
+        )
+        if not_before is None:
+            continue
+        for entry in entries:
+            published = _parse_websub_timestamp(entry.get("published", ""))
+            if not published or published <= not_before:
+                continue
+            validation = validate_link(entry["video_url"])
+            if not validation["valid"] or database.check_cache(validation["shortcode"]):
+                continue
+            position = database.add_to_queue(validation["shortcode"], entry["video_url"])
+            if position >= 0:
+                stats["queued"] += 1
+                logger.info(
+                    "📹 [WebSub Reconcile] Queued missed upload: '%s' (%s)",
+                    entry.get("title", ""), entry["video_url"],
+                )
+    logger.info(
+        "[WebSub] Feed reconciliation: %d/%d fetched, %d queued, %d failed",
+        stats["fetched"], stats["channels"], stats["queued"], stats["failed"],
+    )
+    return stats
+
+
 async def _websub_renewal_loop():
+    last_reconcile = 0.0
     while True:
         try:
             await _renew_websub_subscriptions_once()
         except Exception as exc:
             logger.warning("⚠️ [WebSub] Renewal pass failed: %s", exc)
-        await asyncio.sleep(WEBSUB_RENEW_INTERVAL_SECONDS)
+        now = time.monotonic()
+        if now - last_reconcile >= WEBSUB_RECONCILE_INTERVAL_SECONDS:
+            try:
+                await _reconcile_websub_subscriptions_once()
+            except Exception as exc:
+                logger.warning("⚠️ [WebSub] Feed reconciliation pass failed: %s", exc)
+            last_reconcile = time.monotonic()
+        await asyncio.sleep(min(WEBSUB_RENEW_INTERVAL_SECONDS, WEBSUB_RECONCILE_INTERVAL_SECONDS))
 
 
 @app.get("/api/youtube/webhook")
@@ -2398,6 +2483,12 @@ async def list_youtube_subscriptions(token: str = Depends(verify_token)):
     database = get_db()
     subs = database.list_websub_subscriptions()
     return {"count": len(subs), "subscriptions": subs}
+
+
+@app.post("/api/youtube/subscriptions/reconcile")
+async def reconcile_youtube_subscriptions(token: str = Depends(verify_token)):
+    """Run the missed-delivery catch-up pass immediately."""
+    return await _reconcile_websub_subscriptions_once()
 
 
 # OAuth is deliberately local-only: the Google desktop client redirects to this
