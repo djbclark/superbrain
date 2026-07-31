@@ -107,13 +107,14 @@ async function deltaSync(): Promise<number> {
 /**
  * Decides whether to do a full or delta sync.
  * - Empty local DB → full sync
+ * - forceFull → full sync (pull-to-refresh after server-side migrations)
  * - Has data → delta sync
  * Returns true if any data changed.
  */
-async function syncIfNeeded(): Promise<boolean> {
+async function syncIfNeeded(forceFull: boolean = false): Promise<boolean> {
   try {
     const empty = await localDb.isEmpty();
-    if (empty) {
+    if (empty || forceFull) {
       const count = await fullSync();
       return count > 0;
     } else {
