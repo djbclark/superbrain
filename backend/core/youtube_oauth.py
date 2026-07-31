@@ -116,13 +116,41 @@ def list_subscriptions() -> list[dict[str, str]]:
     token = refresh_access_token()
     items: list[dict[str, str]] = []
     page_token = ""
+    db = None
+    try:
+        from core.database import get_db
+
+        db = get_db()
+    except Exception:
+        db = None
     while True:
         params = {"part": "snippet", "mine": "true", "maxResults": "50"}
         if page_token:
             params["pageToken"] = page_token
-        response = requests.get(SUBSCRIPTIONS_URL, timeout=20, params=params,
-                                headers={"Authorization": f"Bearer {token}"})
-        response.raise_for_status()
+
+        def _get(params=params, token=token):
+            return requests.get(
+                SUBSCRIPTIONS_URL,
+                timeout=20,
+                params=params,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        if db is not None:
+            from core.youtube_quota import instrumented_request
+
+            response = instrumented_request(
+                db,
+                do_request=_get,
+                resource="subscriptions",
+                method="list",
+                operation="subscription_list",
+                priority="new",
+                pages=1,
+            )
+        else:
+            response = _get()
+            response.raise_for_status()
         payload = response.json()
         for item in payload.get("items", []):
             snippet = item.get("snippet", {})

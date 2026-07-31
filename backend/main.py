@@ -658,6 +658,17 @@ def main():
         default=0,
         help="With --sync-category-playlists, max videos to process (0 = all)",
     )
+    parser.add_argument(
+        "--youtube-quota-stats",
+        action="store_true",
+        help="Show durable YouTube Data API usage statistics, then exit",
+    )
+    parser.add_argument(
+        "--youtube-quota-stats-days",
+        type=int,
+        default=1,
+        help="With --youtube-quota-stats, rolling Pacific-day window (default: 1)",
+    )
 
     args = parser.parse_args()
 
@@ -666,14 +677,21 @@ def main():
 
         sys.exit(run_local_browser_connect())
 
-    if args.category_playlists_status or args.sync_category_playlists:
+    if (
+        args.category_playlists_status
+        or args.sync_category_playlists
+        or args.youtube_quota_stats
+    ):
         from core.category_playlists import (
             backfill_category_playlists,
             ensure_runtime_env_for_cli,
             print_category_playlists_status,
+            print_youtube_quota_stats,
         )
 
         ensure_runtime_env_for_cli(entrypoint=Path(__file__))
+        if args.youtube_quota_stats:
+            sys.exit(print_youtube_quota_stats(days=args.youtube_quota_stats_days))
         if args.category_playlists_status:
             sys.exit(print_category_playlists_status())
         sys.exit(

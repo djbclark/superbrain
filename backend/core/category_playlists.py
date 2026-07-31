@@ -373,14 +373,70 @@ def priority_for_analysis_row(
 class YouTubePlaylistClient:
     """Thin YouTube Data API v3 client for playlist create/item mutate."""
 
-    def __init__(self, access_token: Optional[str] = None):
+    def __init__(
+        self,
+        access_token: Optional[str] = None,
+        *,
+        db=None,
+        priority: str = "historic",
+        operation: str = "",
+        job_id: str = "",
+        update_ledger: bool = True,
+    ):
         self._token = access_token
+        self._db = db
+        self.priority = "new" if priority == "new" else "historic"
+        self.operation = operation or ""
+        self.job_id = job_id or ""
+        self.update_ledger = update_ledger
         self.last_list_pages = 0
+
+    def _resolve_db(self):
+        if self._db is not None:
+            return self._db
+        try:
+            from core.database import get_db
+
+            return get_db()
+        except Exception:
+            return None
 
     def _headers(self) -> dict[str, str]:
         token = self._token or youtube_oauth.refresh_access_token()
         self._token = token
         return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    def _request(
+        self,
+        *,
+        resource: str,
+        method: str,
+        do_request,
+        operation: Optional[str] = None,
+        pages: int = 1,
+        ok_statuses: Optional[set[int]] = None,
+    ):
+        from core.youtube_quota import instrumented_request
+
+        db = self._resolve_db()
+        if db is None:
+            response = do_request()
+            if ok_statuses and getattr(response, "status_code", None) in ok_statuses:
+                return response
+            response.raise_for_status()
+            return response
+        return instrumented_request(
+            db,
+            do_request=do_request,
+            resource=resource,
+            method=method,
+            operation=operation if operation is not None else self.operation,
+            job_id=self.job_id,
+            priority=self.priority,
+            pages=pages,
+            update_ledger=self.update_ledger,
+            ok_statuses=ok_statuses,
+        )
 
     def list_my_playlists(self) -> list[dict[str, str]]:
         import requests
@@ -396,10 +452,22 @@ class YouTubePlaylistClient:
             }
             if page_token:
                 params["pageToken"] = page_token
-            response = requests.get(
-                PLAYLISTS_URL, timeout=30, params=params, headers=self._headers()
+
+            def _get(params=params):
+                return requests.get(
+                    PLAYLISTS_URL,
+                    timeout=30,
+                    params=params,
+                    headers=self._headers(),
+                )
+
+            response = self._request(
+                resource="playlists",
+                method="list",
+                do_request=_get,
+                operation=self.operation or "playlist_list",
+                pages=1,
             )
-            response.raise_for_status()
             pages += 1
             payload = response.json()
             for item in payload.get("items", []):
@@ -417,17 +485,24 @@ class YouTubePlaylistClient:
     def create_playlist(self, title: str, privacy_status: str = "private") -> str:
         import requests
 
-        response = requests.post(
-            PLAYLISTS_URL,
-            timeout=30,
-            params={"part": "snippet,status"},
-            headers=self._headers(),
-            json={
-                "snippet": {"title": title},
-                "status": {"privacyStatus": privacy_status},
-            },
+        def _post():
+            return requests.post(
+                PLAYLISTS_URL,
+                timeout=30,
+                params={"part": "snippet,status"},
+                headers=self._headers(),
+                json={
+                    "snippet": {"title": title},
+                    "status": {"privacyStatus": privacy_status},
+                },
+            )
+
+        response = self._request(
+            resource="playlists",
+            method="insert",
+            do_request=_post,
+            operation=self.operation or "playlist_create",
         )
-        response.raise_for_status()
         return response.json()["id"]
 
     def add_video(
@@ -435,37 +510,52 @@ class YouTubePlaylistClient:
     ) -> str:
         import requests
 
-        response = requests.post(
-            PLAYLIST_ITEMS_URL,
-            timeout=30,
-            params={"part": "snippet"},
-            headers=self._headers(),
-            json={
-                "snippet": {
-                    "playlistId": playlist_id,
-                    "position": int(position),
-                    "resourceId": {
-                        "kind": "youtube#video",
-                        "videoId": video_id,
-                    },
-                }
-            },
+        def _post():
+            return requests.post(
+                PLAYLIST_ITEMS_URL,
+                timeout=30,
+                params={"part": "snippet"},
+                headers=self._headers(),
+                json={
+                    "snippet": {
+                        "playlistId": playlist_id,
+                        "position": int(position),
+                        "resourceId": {
+                            "kind": "youtube#video",
+                            "videoId": video_id,
+                        },
+                    }
+                },
+            )
+
+        response = self._request(
+            resource="playlistItems",
+            method="insert",
+            do_request=_post,
+            operation=self.operation or "playlist_item_insert",
         )
-        response.raise_for_status()
         return response.json()["id"]
 
     def remove_playlist_item(self, playlist_item_id: str) -> None:
         import requests
 
-        response = requests.delete(
-            PLAYLIST_ITEMS_URL,
-            timeout=30,
-            params={"id": playlist_item_id},
-            headers=self._headers(),
+        def _delete():
+            return requests.delete(
+                PLAYLIST_ITEMS_URL,
+                timeout=30,
+                params={"id": playlist_item_id},
+                headers=self._headers(),
+            )
+
+        response = self._request(
+            resource="playlistItems",
+            method="delete",
+            do_request=_delete,
+            operation=self.operation or "playlist_item_delete",
+            ok_statuses={404},
         )
         if response.status_code == 404:
             return
-        response.raise_for_status()
 
 
 def ensure_category_playlists(
@@ -491,7 +581,17 @@ def ensure_category_playlists(
     existing_by_title: dict[str, str] = {}
     yt = client
     if not cfg.dry_run:
-        yt = yt or YouTubePlaylistClient()
+        yt = yt or YouTubePlaylistClient(
+            db=db,
+            priority=priority,
+            operation="ensure_playlists",
+        )
+        if hasattr(yt, "priority"):
+            yt.priority = "new" if priority == "new" else "historic"
+        if hasattr(yt, "operation") and not getattr(yt, "operation", None):
+            yt.operation = "ensure_playlists"
+        if hasattr(yt, "_db") and getattr(yt, "_db", None) is None:
+            yt._db = db
         if not can_spend_quota(db, cfg, priority=priority, units=UNITS_PLAYLIST_LIST):
             return {
                 "ok": False,
@@ -502,18 +602,15 @@ def ensure_category_playlists(
             for pl in yt.list_my_playlists():
                 if pl["title"] and pl["playlist_id"]:
                     existing_by_title[pl["title"]] = pl["playlist_id"]
-            pages_raw = getattr(yt, "last_list_pages", 1)
-            try:
-                pages = max(1, int(pages_raw or 1))
-            except (TypeError, ValueError):
-                pages = 1
-            record_quota_spend(
-                db, cfg, priority=priority, units=UNITS_PLAYLIST_LIST * pages
-            )
         except Exception as exc:
             if is_youtube_quota_error(exc):
                 mark_day_exhausted(db)
-                return {"ok": False, "skipped": "quota_exhausted", "error": str(exc), "actions": actions}
+                return {
+                    "ok": False,
+                    "skipped": "quota_exhausted",
+                    "error": str(exc),
+                    "actions": actions,
+                }
             raise
 
     for name in names:
@@ -560,9 +657,6 @@ def ensure_category_playlists(
                         "actions": actions,
                     }
                 raise
-            record_quota_spend(
-                db, cfg, priority=priority, units=UNITS_PLAYLIST_INSERT
-            )
             action = "created"
         if not cfg.dry_run and not playlist_id.startswith("dryrun-"):
             db.upsert_category_youtube_playlist(name, playlist_id, title)
@@ -674,7 +768,21 @@ def sync_video_category(
         result["skipped"] = "quota_budget"
         return result
 
-    yt = None if cfg.dry_run else (client or YouTubePlaylistClient())
+    yt = None if cfg.dry_run else (
+        client
+        or YouTubePlaylistClient(
+            db=db,
+            priority=priority,
+            operation="sync_video_category",
+        )
+    )
+    if yt is not None:
+        if hasattr(yt, "priority"):
+            yt.priority = priority
+        if hasattr(yt, "operation"):
+            yt.operation = getattr(yt, "operation", None) or "sync_video_category"
+        if hasattr(yt, "_db") and getattr(yt, "_db", None) is None:
+            yt._db = db
 
     # Remove from previous category playlist when category changes.
     if needs_remove:
@@ -709,9 +817,6 @@ def sync_video_category(
                     result["error"] = str(exc)
                     return result
                 raise
-            record_quota_spend(
-                db, cfg, priority=priority, units=UNITS_PLAYLIST_ITEM_DELETE
-            )
             db.delete_category_youtube_playlist_item(video_id)
             result["actions"].append(action)
 
@@ -805,9 +910,6 @@ def sync_video_category(
         else:
             raise
     else:
-        record_quota_spend(
-            db, cfg, priority=priority, units=UNITS_PLAYLIST_ITEM_INSERT
-        )
         result["actions"].append(
             {
                 "op": "add",
@@ -965,7 +1067,7 @@ def _idle_sleep(cfg: PlaylistSyncConfig, *, reason: str) -> None:
     time.sleep(secs)
 
 
-def _fetch_unsynced_rows(db, *, limit: int = 0) -> list[dict[str, Any]]:
+def fetch_unsynced_playlist_rows(db, *, limit: int = 0) -> list[dict[str, Any]]:
     rows = db._conn.execute(
         """
         SELECT a.shortcode, a.url, a.category, a.content_type,
@@ -1010,6 +1112,49 @@ def _sync_one_row(
     )
 
 
+def print_youtube_quota_stats(*, days: int = 1) -> int:
+    """CLI: print durable YouTube API usage statistics."""
+    import json
+    import sys
+
+    from core.cli_locks import CliLockUnavailable, exclusive_cli_lock
+    from core.database import Database
+    from core.youtube_quota import COST_TABLE_SOURCE, COST_TABLE_VERSION, usage_summary
+
+    try:
+        with exclusive_cli_lock("youtube-quota-stats"):
+            db = Database()
+            summary = usage_summary(db, days=max(1, int(days or 1)))
+            cfg = load_playlist_sync_config()
+            unsynced = len(fetch_unsynced_playlist_rows(db))
+            planned_insert_units = unsynced * UNITS_PLAYLIST_ITEM_INSERT
+            summary["planner"] = {
+                "unsynced_videos": unsynced,
+                "estimated_insert_units": planned_insert_units,
+                "estimated_insert_days_at_historic_cap": (
+                    round(planned_insert_units / max(1, cfg.historic_normal_cap), 1)
+                    if unsynced
+                    else 0
+                ),
+                "note": (
+                    "Add-only estimate assumes one playlistItems.insert (50 units) "
+                    "per unsynced video; excludes list/ensure overhead and moves."
+                ),
+            }
+            summary["config_budget"] = {
+                "daily_quota_units": cfg.daily_quota_units,
+                "historic_normal_cap": cfg.historic_normal_cap,
+                "near_reset_total_cap": cfg.near_reset_total_cap,
+                "cost_table_version": COST_TABLE_VERSION,
+                "cost_table_source": COST_TABLE_SOURCE,
+            }
+            print(json.dumps(summary, indent=2))
+            return 0
+    except CliLockUnavailable as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
+
+
 def print_category_playlists_status() -> int:
     import json
     import sys
@@ -1017,6 +1162,7 @@ def print_category_playlists_status() -> int:
     from core.cli_locks import CliLockUnavailable, exclusive_cli_lock
     from core.database import Database
     from core.taxonomy import get_taxonomy
+    from core.youtube_quota import usage_summary
 
     try:
         with exclusive_cli_lock("category-playlists-status"):
@@ -1052,6 +1198,7 @@ def print_category_playlists_status() -> int:
                             "historic_normal_cap": cfg.historic_normal_cap,
                             "near_reset_total_cap": cfg.near_reset_total_cap,
                         },
+                        "usage": usage_summary(db, day_key=day),
                         "pending": {
                             "count": len(pending),
                             "new": sum(1 for p in pending if p.get("priority") == "new"),
@@ -1063,7 +1210,7 @@ def print_category_playlists_status() -> int:
                         "synced_items": db._conn.execute(
                             "select count(*) from category_youtube_playlist_items"
                         ).fetchone()[0],
-                        "unsynced_estimate": len(_fetch_unsynced_rows(db)),
+                        "unsynced_estimate": len(fetch_unsynced_playlist_rows(db)),
                         "oauth_refresh_token_set": bool(
                             os.getenv("YOUTUBE_OAUTH_REFRESH_TOKEN")
                         ),
@@ -1269,7 +1416,7 @@ def backfill_category_playlists(
                     break
 
                 # 3) Newest-first unsynced rows.
-                rows = _fetch_unsynced_rows(db)
+                rows = fetch_unsynced_playlist_rows(db)
                 if not rows and not db.list_category_youtube_playlist_pending():
                     print("Backfill complete: no unsynced or pending items", flush=True)
                     break

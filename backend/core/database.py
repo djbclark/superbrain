@@ -317,6 +317,35 @@ class Database:
         """)
         self._conn.commit()
 
+        # Durable YouTube Data API usage events (no tokens/headers/payloads)
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS youtube_api_usage_events (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts                 TEXT NOT NULL,
+                day_key            TEXT NOT NULL,
+                resource           TEXT NOT NULL,
+                method             TEXT NOT NULL,
+                http_status        INTEGER,
+                result_class       TEXT NOT NULL,
+                units              INTEGER NOT NULL DEFAULT 0,
+                units_known        INTEGER NOT NULL DEFAULT 1,
+                duration_ms        INTEGER,
+                operation          TEXT,
+                job_id             TEXT,
+                retry_count        INTEGER NOT NULL DEFAULT 0,
+                error_class        TEXT,
+                cost_table_version TEXT,
+                priority           TEXT NOT NULL DEFAULT 'historic'
+            );
+            CREATE INDEX IF NOT EXISTS idx_yt_usage_day
+                ON youtube_api_usage_events (day_key, ts);
+            CREATE INDEX IF NOT EXISTS idx_yt_usage_endpoint
+                ON youtube_api_usage_events (resource, method, day_key);
+            CREATE INDEX IF NOT EXISTS idx_yt_usage_operation
+                ON youtube_api_usage_events (operation, day_key);
+        """)
+        self._conn.commit()
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -1584,6 +1613,165 @@ class Database:
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def insert_youtube_api_usage_event(
+        self,
+        *,
+        day_key,
+        resource,
+        method,
+        http_status=None,
+        result_class="ok",
+        units=0,
+        units_known=1,
+        duration_ms=None,
+        operation="",
+        job_id="",
+        retry_count=0,
+        error_class="",
+        cost_table_version="",
+        priority="historic",
+        ts=None,
+    ):
+        now = ts or _utcnow().isoformat()
+        self._conn.execute(
+            """
+            INSERT INTO youtube_api_usage_events (
+                ts, day_key, resource, method, http_status, result_class,
+                units, units_known, duration_ms, operation, job_id,
+                retry_count, error_class, cost_table_version, priority
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                day_key,
+                resource,
+                method,
+                http_status,
+                result_class,
+                int(units or 0),
+                1 if units_known else 0,
+                duration_ms,
+                operation or "",
+                job_id or "",
+                int(retry_count or 0),
+                error_class or "",
+                cost_table_version or "",
+                "new" if priority == "new" else "historic",
+            ),
+        )
+        self._conn.commit()
+
+    def _youtube_usage_day_filter(self, day_key=None, days=1):
+        if day_key:
+            return "day_key = ?", (day_key,)
+        if days and days > 1:
+            # Rolling window by Pacific day_key string compare works for ISO dates.
+            from core.youtube_quota import pacific_day_key
+            from datetime import datetime, timedelta
+
+            try:
+                from zoneinfo import ZoneInfo
+
+                pt = ZoneInfo("America/Los_Angeles")
+            except Exception:
+                from datetime import timezone as _tz
+
+                pt = _tz.utc
+            end = datetime.now(pt)
+            start = (end - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+            end_key = end.strftime("%Y-%m-%d")
+            return "day_key >= ? AND day_key <= ?", (start, end_key)
+        from core.youtube_quota import pacific_day_key
+
+        return "day_key = ?", (pacific_day_key(),)
+
+    def summarize_youtube_api_usage(self, *, day_key=None, days=1):
+        where, params = self._youtube_usage_day_filter(day_key=day_key, days=days)
+        row = self._conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS calls,
+                COALESCE(SUM(units), 0) AS units,
+                COALESCE(SUM(CASE WHEN result_class = 'ok' THEN 1 ELSE 0 END), 0) AS ok,
+                COALESCE(SUM(CASE WHEN result_class != 'ok' THEN 1 ELSE 0 END), 0) AS failed,
+                COALESCE(SUM(CASE WHEN result_class = 'quota_error' THEN 1 ELSE 0 END), 0) AS quota_errors,
+                COALESCE(SUM(retry_count), 0) AS retries,
+                COALESCE(SUM(CASE WHEN units_known = 0 THEN 1 ELSE 0 END), 0) AS unknown_cost_calls
+            FROM youtube_api_usage_events
+            WHERE {where}
+            """,
+            params,
+        ).fetchone()
+        return dict(row) if row else {}
+
+    def summarize_youtube_api_usage_by_endpoint(self, *, day_key=None, days=1):
+        where, params = self._youtube_usage_day_filter(day_key=day_key, days=days)
+        rows = self._conn.execute(
+            f"""
+            SELECT resource, method,
+                   COUNT(*) AS calls,
+                   COALESCE(SUM(units), 0) AS units,
+                   COALESCE(SUM(CASE WHEN result_class != 'ok' THEN 1 ELSE 0 END), 0) AS failed
+            FROM youtube_api_usage_events
+            WHERE {where}
+            GROUP BY resource, method
+            ORDER BY units DESC, calls DESC
+            """,
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def summarize_youtube_api_usage_by_operation(self, *, day_key=None, days=1):
+        where, params = self._youtube_usage_day_filter(day_key=day_key, days=days)
+        rows = self._conn.execute(
+            f"""
+            SELECT COALESCE(NULLIF(operation, ''), '(none)') AS operation,
+                   COUNT(*) AS calls,
+                   COALESCE(SUM(units), 0) AS units,
+                   COALESCE(SUM(CASE WHEN result_class != 'ok' THEN 1 ELSE 0 END), 0) AS failed
+            FROM youtube_api_usage_events
+            WHERE {where}
+            GROUP BY COALESCE(NULLIF(operation, ''), '(none)')
+            ORDER BY units DESC, calls DESC
+            """,
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_unknown_youtube_api_methods(self, *, day_key=None, days=1):
+        where, params = self._youtube_usage_day_filter(day_key=day_key, days=days)
+        rows = self._conn.execute(
+            f"""
+            SELECT resource, method, COUNT(*) AS calls
+            FROM youtube_api_usage_events
+            WHERE {where} AND units_known = 0
+            GROUP BY resource, method
+            ORDER BY calls DESC
+            """,
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def prune_youtube_api_usage_events(self, *, keep_days: int = 90) -> int:
+        keep_days = max(1, int(keep_days))
+        from datetime import datetime, timedelta
+
+        try:
+            from zoneinfo import ZoneInfo
+
+            pt = ZoneInfo("America/Los_Angeles")
+        except Exception:
+            from datetime import timezone as _tz
+
+            pt = _tz.utc
+        cutoff = (datetime.now(pt) - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+        cur = self._conn.execute(
+            "DELETE FROM youtube_api_usage_events WHERE day_key < ?",
+            (cutoff,),
+        )
+        self._conn.commit()
+        return cur.rowcount
 
 
 # ------------------------------------------------------------------

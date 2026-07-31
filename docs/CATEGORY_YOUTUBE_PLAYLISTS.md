@@ -101,16 +101,28 @@ superbrain --sync-category-playlists --sync-category-playlists-limit 20
 4. Caps historic spend early in the day; idles in short sleeps until the
    near-reset window (or midnight), instead of a single blind 24h sleep.
 
+```bash
+superbrain --youtube-quota-stats           # durable API usage for today (PT)
+superbrain --youtube-quota-stats --youtube-quota-stats-days 7
+```
+
+Usage events are stored in `youtube_api_usage_events` (no tokens/headers/payloads)
+with a versioned cost table (`core/youtube_quota.py`, currently dated
+`2026-07-31`). Failed calls are still charged when the method cost is known.
+`--category-playlists-status` includes the same daily usage rollup.
+
 Concurrent accidental runs are blocked with exclusive flock locks under
 `~/.superbrain-server/locks/` for `--youtube-connect`,
-`--sync-category-playlists`, and `--category-playlists-status`.
+`--sync-category-playlists`, `--category-playlists-status`, and
+`--youtube-quota-stats`.
 
 ## API
 
 | Method | Path | Notes |
 |--------|------|--------|
 | GET | `/api/youtube/oauth/status` | Includes `oauth_scope` + playlist config |
-| GET | `/api/youtube/category-playlists/status` | Config + local mappings |
+| GET | `/api/youtube/category-playlists/status` | Config + mappings + quota/usage |
+| GET | `/api/youtube/quota/stats` | Durable usage rollup (`?days=1`) |
 | POST | `/api/youtube/category-playlists/ensure` | Create/adopt playlists |
 | POST | `/api/youtube/category-playlists/sync/{shortcode}` | Sync one analysis |
 

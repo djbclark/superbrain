@@ -2638,23 +2638,56 @@ async def discover_youtube_subscriptions(token: str = Depends(verify_token)):
 
 @app.get("/api/youtube/category-playlists/status")
 async def category_playlists_status(token: str = Depends(verify_token)):
-    """Show category→playlist mapping and sync config (no YouTube mutations)."""
-    from core.category_playlists import load_playlist_sync_config
+    """Show category→playlist mapping, sync config, and quota usage."""
+    from core.category_playlists import (
+        fetch_unsynced_playlist_rows,
+        is_near_quota_reset,
+        load_playlist_sync_config,
+        pacific_day_key,
+        hours_until_pacific_midnight,
+    )
     from core.taxonomy import get_taxonomy
+    from core.youtube_quota import usage_summary
 
     db = get_db()
     cfg = load_playlist_sync_config()
     tax = get_taxonomy()
+    day = pacific_day_key()
     return {
         "config": {
             "enabled": cfg.enabled,
             "dry_run": cfg.dry_run,
             "title_prefix": cfg.title_prefix,
             "privacy_status": cfg.privacy_status,
+            "daily_quota_units": cfg.daily_quota_units,
+            "new_video_reserve_pct": cfg.new_video_reserve_pct,
+            "near_reset_hours": cfg.near_reset_hours,
+            "near_reset_historic_pct": cfg.near_reset_historic_pct,
             "categories": list(cfg.categories) if cfg.categories else tax.names,
         },
+        "quota": {
+            "day_key": day,
+            "near_reset": is_near_quota_reset(cfg),
+            "hours_until_reset": round(hours_until_pacific_midnight(), 2),
+            "ledger": db.ensure_youtube_quota_ledger(day),
+            "historic_normal_cap": cfg.historic_normal_cap,
+            "near_reset_total_cap": cfg.near_reset_total_cap,
+        },
+        "usage": usage_summary(db, day_key=day),
         "mappings": db.list_category_youtube_playlists(),
+        "unsynced_estimate": len(fetch_unsynced_playlist_rows(db)),
     }
+
+
+@app.get("/api/youtube/quota/stats")
+async def youtube_quota_stats(
+    days: int = 1,
+    token: str = Depends(verify_token),
+):
+    """Durable YouTube Data API usage statistics (estimated units)."""
+    from core.youtube_quota import usage_summary
+
+    return usage_summary(get_db(), days=max(1, min(90, int(days or 1))))
 
 
 @app.post("/api/youtube/category-playlists/ensure")
