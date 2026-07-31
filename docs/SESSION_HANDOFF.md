@@ -1,7 +1,8 @@
 # SuperBrain session handoff
 
-Status captured **2026-07-31 afternoon ET**. Live playlist backfill is sleeping
-until Pacific midnight (~03:00 ET / 00:00 PT on 2026-08-01).
+Status captured **2026-07-31 afternoon ET** (updated late afternoon).
+Live playlist backfill is sleeping until Pacific midnight (~03:00 ET /
+00:00 PT on 2026-08-01).
 
 ## Current next action
 
@@ -41,6 +42,20 @@ Runtime: `~/.superbrain-server`. Log:
 
 Fork #5 operator decisions (2026-07-31): playlist **rebuild execution** and **hosted per-user budgets** are deferred (later). Planner stays recommendation-only; self-hosted keeps a single-tenant local ledger until issues #1/#2.
 
+## Fork PR #6 — Android taxonomy sync (draft)
+
+[djbclark/superbrain#6](https://github.com/djbclark/superbrain/pull/6)
+(`draft/android-category-sync` → `main`, tip `44a655d`)
+
+Android client support for config-driven category taxonomy, gated so
+upstream mainline behavior is unchanged until `GET /taxonomy` exists.
+Reviewed and all findings fixed (deduplicated taxonomy HTTP calls, deferred
+taxonomy gate behind connectivity check, unconditional version persist).
+TypeScript passes.
+
+**Status:** Draft on fork. Mark ready / open upstream only after confirming
+the upstream taxonomy backend ships alongside or ahead of this client PR.
+
 ## Upstream contribution sequence
 
 Wait for upstream review of these ready, clean pull requests:
@@ -68,7 +83,8 @@ Mirrored proposal: [fork issue #4](https://github.com/djbclark/superbrain/issues
 Quota instrumentation: [fork issue #5](https://github.com/djbclark/superbrain/issues/5).
 
 Branch tips: `dpr/test-live-api-isolation` `937704c`,
-`dpr/mobile-delta-sync-pagination` `44df0a0`, `prep/biome-tooling` `b5301e8`.
+`dpr/mobile-delta-sync-pagination` `44df0a0`, `prep/biome-tooling` `b5301e8`,
+`draft/android-category-sync` `44a655d`.
 
 ## YouTube quota request
 
