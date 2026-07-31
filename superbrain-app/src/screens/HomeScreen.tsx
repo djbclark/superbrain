@@ -42,6 +42,7 @@ import BottomNav from '../components/BottomNav';
 import { getCollectionIconName, getCollectionIconColor } from '../constants/icons';
 import { ALL_CATEGORY, DEFAULT_CATEGORIES, CATEGORY_ICONS } from '../constants/categories';
 import {
+  TaxonomyPayload,
   isTaxonomyApiActive,
   usesStrictCustomTaxonomy,
 } from '../services/taxonomySupport';
@@ -75,6 +76,8 @@ const HomeScreen = () => {
   const [onboardingStep, setOnboardingStep] = useState(0);
   const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
   const lastFocusRefreshRef = useRef(0);
+  /** Caches the GET /taxonomy result within a single loadPosts call. */
+  const taxonomyRef = useRef<TaxonomyPayload | null | undefined>(undefined);
 
   useEffect(() => {
     const bootstrap = async () => {
@@ -289,6 +292,8 @@ const HomeScreen = () => {
   };
 
   const loadPosts = async (forceRefresh: boolean = false) => {
+    // Reset taxonomy cache for this load cycle; re-fetched lazily below.
+    taxonomyRef.current = undefined;
     try {
       // Reconcile: if a post was in the failed list AND still stuck in analyzing, clean it up.
       const failedList = await postsCache.getFailedPosts();
@@ -324,11 +329,20 @@ const HomeScreen = () => {
 
         // Upstream path: return early when local data is enough.
         // Taxonomy-aware servers: always continue so migrations reach the device.
+        // Defer the taxonomy check until after we confirm connectivity (below)
+        // to avoid a 404 round-trip on upstream servers that lack GET /taxonomy.
         if (!forceRefresh && analyzingShortcodes.length === 0) {
+          const isOnlineForGate = await apiService.testConnection().catch(() => false);
+          if (!isOnlineForGate) {
+            return;
+          }
           const taxonomy = await apiService.getTaxonomy().catch(() => null);
           if (!isTaxonomyApiActive(taxonomy)) {
             return;
           }
+          // taxonomy is active — fall through to background sync below.
+          // Stash result so syncIfNeeded and post-sync reload can reuse it.
+          taxonomyRef.current = taxonomy;
         }
       } else {
         // No local data at all — show loading spinner
@@ -346,12 +360,15 @@ const HomeScreen = () => {
 
         // forceFull / taxonomy_version resync only activate when GET /taxonomy exists
         // (see syncService); without it this matches upstream delta-only sync.
-        const dataChanged = await syncService.syncIfNeeded(forceRefresh);
+        // Reuse any taxonomy payload already fetched above to avoid a redundant call.
+        const taxonomy = taxonomyRef.current !== undefined
+          ? taxonomyRef.current
+          : await apiService.getTaxonomy().catch(() => null);
+        const dataChanged = await syncService.syncIfNeeded(forceRefresh, taxonomy);
 
         // If sync brought new data, re-read from local DB and update UI
         if (dataChanged || forceRefresh) {
           // Category chip reload is taxonomy-aware; skip extra work on mainline.
-          const taxonomy = await apiService.getTaxonomy().catch(() => null);
           if (isTaxonomyApiActive(taxonomy)) {
             await loadCategories();
           }

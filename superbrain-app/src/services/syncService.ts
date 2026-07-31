@@ -10,6 +10,7 @@
 import localDb from './localDb';
 import apiService from './api';
 import { Post } from '../types';
+import { TaxonomyPayload, isTaxonomyApiActive } from './taxonomySupport';
 
 const BATCH_SIZE = 200; // posts per batch during full sync
 
@@ -112,17 +113,25 @@ async function deltaSync(): Promise<number> {
  *   is ignored so behavior matches upstream mainline (delta only).
  * - taxonomy_version change → full sync (no-op when endpoint absent)
  * - Has data → delta sync
+ *
+ * Accepts an optional pre-fetched taxonomy payload so callers that already
+ * fetched GET /taxonomy do not trigger a redundant round-trip.
  * Returns true if any data changed.
  */
-async function syncIfNeeded(forceFull: boolean = false): Promise<boolean> {
+async function syncIfNeeded(
+  forceFull: boolean = false,
+  prefetchedTaxonomy?: TaxonomyPayload | null,
+): Promise<boolean> {
   try {
     const empty = await localDb.isEmpty();
     let taxonomyChanged = false;
     let taxonomyVersion = '';
     let taxonomyActive = false;
     try {
-      const taxonomy = await apiService.getTaxonomy();
-      taxonomyActive = !!(taxonomy && taxonomy.categories.length > 0);
+      const taxonomy = prefetchedTaxonomy !== undefined
+        ? prefetchedTaxonomy
+        : await apiService.getTaxonomy();
+      taxonomyActive = isTaxonomyApiActive(taxonomy);
       taxonomyVersion = taxonomyActive ? (taxonomy?.taxonomy_version || '') : '';
       if (taxonomyVersion) {
         const localVersion = await localDb.getSyncMeta('taxonomy_version');
@@ -141,7 +150,7 @@ async function syncIfNeeded(forceFull: boolean = false): Promise<boolean> {
 
     if (empty || effectiveForceFull || taxonomyChanged) {
       const count = await fullSync();
-      if (count > 0 && taxonomyVersion) {
+      if (taxonomyVersion) {
         await localDb.setSyncMeta('taxonomy_version', taxonomyVersion);
       }
       return count > 0;
