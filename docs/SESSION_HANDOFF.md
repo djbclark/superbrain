@@ -42,10 +42,10 @@ Runtime: `~/.superbrain-server`. Log:
 
 Fork #5 operator decisions (2026-07-31): playlist **rebuild execution** and **hosted per-user budgets** are deferred (later). Planner stays recommendation-only; self-hosted keeps a single-tenant local ledger until issues #1/#2.
 
-## Fork PR #6 — Android taxonomy sync (draft)
+## Upstream PR #7 — Android taxonomy sync
 
-[djbclark/superbrain#6](https://github.com/djbclark/superbrain/pull/6)
-(`draft/android-category-sync` → `main`, tip `44a655d`)
+[sidinsearch/superbrain#7](https://github.com/sidinsearch/superbrain/pull/7)
+(`draft/android-category-sync` → upstream `main`, tip `44a655d`)
 
 Android client support for config-driven category taxonomy, gated so
 upstream mainline behavior is unchanged until `GET /taxonomy` exists.
@@ -53,8 +53,7 @@ Reviewed and all findings fixed (deduplicated taxonomy HTTP calls, deferred
 taxonomy gate behind connectivity check, unconditional version persist).
 TypeScript passes.
 
-**Status:** Draft on fork. Mark ready / open upstream only after confirming
-the upstream taxonomy backend ships alongside or ahead of this client PR.
+**Status:** Submitted to upstream. (Previous fork draft PR #6 closed).
 
 ## Upstream contribution sequence
 
@@ -62,6 +61,7 @@ Wait for upstream review of these ready, clean pull requests:
 
 - [sidinsearch/superbrain#4 — isolate the live API probe](https://github.com/sidinsearch/superbrain/pull/4)
 - [sidinsearch/superbrain#5 — paginate mobile delta sync](https://github.com/sidinsearch/superbrain/pull/5)
+- [sidinsearch/superbrain#7 — Android taxonomy sync + hide built-in default chips](https://github.com/sidinsearch/superbrain/pull/7)
 
 Also wait for maintainer feedback on
 [sidinsearch/superbrain#6 — opt-in YouTube subscription organization and private category playlists](https://github.com/sidinsearch/superbrain/issues/6).
