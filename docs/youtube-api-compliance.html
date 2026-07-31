@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SuperBrain — YouTube API Client</title>
+  <style>
+    :root {
+      --bg: #0b0d10;
+      --card: #151a21;
+      --text: #e8eef7;
+      --muted: #9aa7b8;
+      --accent: #ff0033;
+      --link: #7eb6ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: radial-gradient(1200px 600px at 20% -10%, #1a2330, var(--bg));
+      color: var(--text);
+      line-height: 1.55;
+    }
+    header, main, footer { max-width: 52rem; margin: 0 auto; padding: 1.25rem 1.25rem; }
+    header {
+      display: flex; flex-wrap: wrap; gap: 1rem; align-items: center;
+      justify-content: space-between; border-bottom: 1px solid #243041;
+    }
+    .brand { display: flex; gap: .75rem; align-items: center; font-weight: 700; font-size: 1.25rem; }
+    .brand img { width: 36px; height: 36px; }
+    nav a { color: var(--muted); margin-left: 1rem; text-decoration: none; }
+    nav a:hover { color: var(--text); }
+    .hero {
+      margin-top: 2rem; padding: 1.5rem; border-radius: 16px; background: var(--card);
+      border: 1px solid #2a3545;
+    }
+    .badge {
+      display: inline-flex; align-items: center; gap: .4rem;
+      background: #221016; color: #ffb3c1; border: 1px solid #5a1828;
+      border-radius: 999px; padding: .25rem .7rem; font-size: .85rem; margin-bottom: 1rem;
+    }
+    h1 { margin: 0 0 .75rem; font-size: 2rem; }
+    p { color: var(--muted); }
+    a { color: var(--link); }
+    .yt {
+      display: flex; gap: .75rem; align-items: center; margin-top: 1.25rem;
+      padding: .9rem 1rem; border-radius: 12px; background: #10080c;
+      border: 1px solid #3a1520;
+    }
+    .yt strong { color: var(--text); }
+    ul { color: var(--muted); }
+    footer { color: var(--muted); font-size: .9rem; border-top: 1px solid #243041; margin-top: 2rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span aria-hidden="true">🧠</span>
+      <span>SuperBrain</span>
+    </div>
+    <nav>
+      <a href="https://superbrain.sidx.dev/">Product site</a>
+      <a href="https://github.com/djbclark/superbrain/blob/main/docs/PRIVACY.md">Privacy Policy</a>
+      <a href="https://github.com/djbclark/superbrain/blob/main/docs/TERMS.md">Terms of Service</a>
+      <a href="https://github.com/djbclark/superbrain">GitHub</a>
+    </nav>
+  </header>
+  <main>
+    <section class="hero">
+      <div class="badge">YouTube API Services client · self-hosted</div>
+      <h1>SuperBrain</h1>
+      <p>
+        SuperBrain is a self-hosted AI second-brain app for saving and organizing
+        digital content, including YouTube videos you choose to analyze.
+        This page describes the <strong>djbclark/superbrain</strong> fork’s
+        YouTube API client for compliance and quota reviews.
+      </p>
+      <div class="yt">
+        <!-- Text wordmark for YouTube attribution (no trademark stylization beyond the name). -->
+        <strong>YouTube</strong>
+        <span>Used via official YouTube Data API Services with user-granted OAuth access.</span>
+      </div>
+      <p style="margin-top:1.25rem">
+        Legal:
+        <a href="https://github.com/djbclark/superbrain/blob/main/docs/PRIVACY.md">Privacy Policy</a>
+        ·
+        <a href="https://github.com/djbclark/superbrain/blob/main/docs/TERMS.md">Terms of Service</a>
+        ·
+        <a href="https://policies.google.com/privacy">Google Privacy Policy</a>
+        ·
+        <a href="https://www.youtube.com/t/terms">YouTube Terms of Service</a>
+      </p>
+    </section>
+
+    <section>
+      <h2>What the YouTube integration does</h2>
+      <ul>
+        <li>OAuth sign-in so you can authorize SuperBrain on your Google account</li>
+        <li>Read subscriptions for channel update / WebSub workflows</li>
+        <li>Create and update <em>your</em> private category playlists (playlist create/update/item insert)</li>
+        <li>Does <strong>not</strong> use <code>youtube.search.list</code></li>
+        <li>Videos are opened on YouTube (or shown via official thumbnails); SuperBrain is not a substitute YouTube client UI for playback embedding in this fork</li>
+      </ul>
+      <p>
+        Revoke access anytime:
+        <a href="https://myaccount.google.com/permissions">Google Account → Third-party access</a>
+      </p>
+    </section>
+  </main>
+  <footer>
+    <p>
+      SuperBrain fork documentation for YouTube API Services audits.
+      Product marketing: <a href="https://superbrain.sidx.dev/">superbrain.sidx.dev</a>.
+      Source: <a href="https://github.com/djbclark/superbrain">github.com/djbclark/superbrain</a>.
+    </p>
+  </footer>
+</body>
+</html>
