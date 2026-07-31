@@ -4,6 +4,16 @@ Welcome to the SuperBrain documentation! This folder contains all detailed guide
 
 ---
 
+## Active Work and YouTube API Compliance
+
+- **[Session Handoff](SESSION_HANDOFF.md)** - Current upstream reviews, contribution sequence, and resume instructions
+- **[YouTube API Quota Handoff](YOUTUBE_API_QUOTA_HANDOFF.md)** - Public form answers, quota rationale, evidence, and resubmission checklist
+- **[YouTube API Compliance Assets](compliance-screenshots/README.md)** - Exact submitted screenshots and supporting diagrams
+
+AI coding agents should begin with **[AGENTS.md](../AGENTS.md)** in the repository root.
+
+---
+
 ## 🚀 Getting Started
 
 - **[QUICKSTART.md](QUICKSTART.md)** - Get up and running in 5 minutes

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <rect width="1600" height="900" fill="#ffffff"/>
+  <style>text{font-family:Arial,sans-serif;fill:#172033}.title{font-size:38px;font-weight:700}.sub{font-size:20px;fill:#526174}.h{font-size:22px;font-weight:700}.b{font-size:18px}.small{font-size:15px;fill:#526174}.box{fill:#f7f9fc;stroke:#5a6b82;stroke-width:2}.oauth{fill:#fff4f4;stroke:#cc3030;stroke-width:2}.result{fill:#f2fbf5;stroke:#398758;stroke-width:2}.line{stroke:#526174;stroke-width:3;fill:none;marker-end:url(#arrow)}</style>
+  <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#526174"/></marker></defs>
+  <text x="80" y="75" class="title">SuperBrain — user flow for YouTube playlist synchronization</text>
+  <text x="80" y="110" class="sub">The user controls authorization and the content that is organized.</text>
+  <rect x="80" y="220" width="220" height="145" rx="16" class="box"/><text x="190" y="270" text-anchor="middle" class="h">1. Connect</text><text x="190" y="305" text-anchor="middle" class="b">User starts</text><text x="190" y="332" text-anchor="middle" class="b">YouTube connection</text>
+  <rect x="410" y="220" width="250" height="145" rx="16" class="oauth"/><text x="535" y="270" text-anchor="middle" class="h">2. Consent</text><text x="535" y="305" text-anchor="middle" class="b">Google OAuth screen</text><text x="535" y="332" text-anchor="middle" class="b">user grants access</text>
+  <rect x="770" y="220" width="250" height="145" rx="16" class="box"/><text x="895" y="270" text-anchor="middle" class="h">3. Organize</text><text x="895" y="305" text-anchor="middle" class="b">SuperBrain categorizes</text><text x="895" y="332" text-anchor="middle" class="b">user-selected videos</text>
+  <rect x="1130" y="220" width="300" height="145" rx="16" class="result"/><text x="1280" y="270" text-anchor="middle" class="h">4. Sync privately</text><text x="1280" y="305" text-anchor="middle" class="b">Create/update category</text><text x="1280" y="332" text-anchor="middle" class="b">playlists on that account</text>
+  <path d="M300 292 H410" class="line"/><path d="M660 292 H770" class="line"/><path d="M1020 292 H1130" class="line"/>
+  <rect x="280" y="570" width="1040" height="150" rx="16" class="box"/><text x="800" y="620" text-anchor="middle" class="h">User controls and limits</text><text x="800" y="658" text-anchor="middle" class="b">Only private playlists for the authorizing account are created or updated. No keyword search discovery is used.</text><text x="800" y="690" text-anchor="middle" class="b">The user may disable sync locally or revoke OAuth access at any time through Google Account permissions.</text>
+  <path d="M1280 365 V570" class="line"/>
+</svg>

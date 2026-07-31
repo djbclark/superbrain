@@ -1,5 +1,8 @@
 # YouTube API compliance assets
 
+The completed public, non-sensitive form record and resubmission checklist are
+in [`../YOUTUBE_API_QUOTA_HANDOFF.md`](../YOUTUBE_API_QUOTA_HANDOFF.md).
+
 Public legal URLs for quota / audit forms:
 
 | Document | URL |
@@ -33,3 +36,12 @@ Capture helper (macOS with Chrome):
 ```bash
 docs/compliance-screenshots/capture.sh
 ```
+
+## Supporting material
+
+The `supporting-materials/` directory contains the exact design PNGs submitted
+with the quota request and their editable SVG sources:
+
+- `superbrain-youtube-architecture.{png,svg}`
+- `superbrain-youtube-user-flow.{png,svg}`
+- `superbrain-youtube-data-handling.{png,svg}`
