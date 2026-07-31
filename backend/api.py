@@ -760,6 +760,7 @@ async def get_recent_analyses(
 async def sync_posts(
     since: str = Query(..., description="ISO timestamp — return posts updated after this time"),
     limit: int = Query(default=500, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0, description="Number of matching rows to skip"),
     token: str = Depends(verify_token),
 ):
     """
@@ -769,12 +770,17 @@ async def sync_posts(
     """
     try:
         db = get_db()
-        results = db.get_posts_since(since, limit=limit)
+        page = db.get_posts_since(since, limit=limit + 1, offset=offset)
+        has_more = len(page) > limit
+        results = page[:limit]
 
         return {
             "success": True,
             "count": len(results),
             "since": since,
+            "offset": offset,
+            "next_offset": offset + len(results) if has_more else None,
+            "has_more": has_more,
             "data": results
         }
 

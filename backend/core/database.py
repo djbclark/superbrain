@@ -294,7 +294,7 @@ class Database:
             print(f"[WARNING]  Error retrieving recent (light): {e}")
             return []
 
-    def get_posts_since(self, updated_after: str, limit=1000):
+    def get_posts_since(self, updated_after: str, limit=1000, offset=0):
         """Return posts updated after the given ISO timestamp (delta sync).
         Includes soft-deleted posts so the app knows to hide them."""
         if not self.is_connected():
@@ -304,8 +304,8 @@ class Database:
             cur.execute(
                 f"SELECT {self.LIGHT_COLUMNS} FROM analyses "
                 "WHERE updated_at > ? "
-                "ORDER BY updated_at ASC LIMIT ?",
-                (updated_after, limit)
+                "ORDER BY updated_at ASC, shortcode ASC LIMIT ? OFFSET ?",
+                (updated_after, limit, offset)
             )
             return [self._row_to_dict(r) for r in cur.fetchall()]
         except Exception as e:
