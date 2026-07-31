@@ -292,6 +292,31 @@ class Database:
         """)
         self._conn.commit()
 
+        # Local YouTube Data API quota ledger (Pacific calendar day) + deferred sync
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS youtube_api_quota_ledger (
+                day_key              TEXT PRIMARY KEY,
+                units_used           INTEGER NOT NULL DEFAULT 0,
+                new_units_used       INTEGER NOT NULL DEFAULT 0,
+                historic_units_used  INTEGER NOT NULL DEFAULT 0,
+                exhausted_at         TEXT,
+                updated_at           TEXT
+            );
+            CREATE TABLE IF NOT EXISTS category_youtube_playlist_pending (
+                shortcode    TEXT PRIMARY KEY,
+                priority     TEXT NOT NULL DEFAULT 'historic',
+                category     TEXT,
+                url          TEXT,
+                attempts     INTEGER NOT NULL DEFAULT 0,
+                last_error   TEXT,
+                created_at   TEXT,
+                updated_at   TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_cat_yt_pending_priority
+                ON category_youtube_playlist_pending (priority, updated_at);
+        """)
+        self._conn.commit()
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -1406,6 +1431,156 @@ class Database:
         cur = self._conn.execute(
             "DELETE FROM category_youtube_playlist_items WHERE video_id = ?",
             (video_id,),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # YouTube API quota ledger + pending playlist sync
+    # ------------------------------------------------------------------
+
+    def get_youtube_quota_ledger(self, day_key):
+        row = self._conn.execute(
+            "SELECT * FROM youtube_api_quota_ledger WHERE day_key = ?",
+            (day_key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def ensure_youtube_quota_ledger(self, day_key):
+        existing = self.get_youtube_quota_ledger(day_key)
+        if existing:
+            return existing
+        now = _utcnow().isoformat()
+        self._conn.execute(
+            """
+            INSERT INTO youtube_api_quota_ledger
+                (day_key, units_used, new_units_used, historic_units_used, exhausted_at, updated_at)
+            VALUES (?, 0, 0, 0, NULL, ?)
+            """,
+            (day_key, now),
+        )
+        self._conn.commit()
+        return self.get_youtube_quota_ledger(day_key)
+
+    def record_youtube_quota_spend(self, day_key, *, units, priority="historic"):
+        self.ensure_youtube_quota_ledger(day_key)
+        now = _utcnow().isoformat()
+        if priority == "new":
+            self._conn.execute(
+                """
+                UPDATE youtube_api_quota_ledger SET
+                    units_used = units_used + ?,
+                    new_units_used = new_units_used + ?,
+                    updated_at = ?
+                WHERE day_key = ?
+                """,
+                (units, units, now, day_key),
+            )
+        else:
+            self._conn.execute(
+                """
+                UPDATE youtube_api_quota_ledger SET
+                    units_used = units_used + ?,
+                    historic_units_used = historic_units_used + ?,
+                    updated_at = ?
+                WHERE day_key = ?
+                """,
+                (units, units, now, day_key),
+            )
+        self._conn.commit()
+        return self.get_youtube_quota_ledger(day_key)
+
+    def mark_youtube_quota_exhausted(self, day_key):
+        self.ensure_youtube_quota_ledger(day_key)
+        now = _utcnow().isoformat()
+        self._conn.execute(
+            """
+            UPDATE youtube_api_quota_ledger
+            SET exhausted_at = COALESCE(exhausted_at, ?), updated_at = ?
+            WHERE day_key = ?
+            """,
+            (now, now, day_key),
+        )
+        self._conn.commit()
+
+    def clear_youtube_quota_exhausted(self, day_key):
+        self.ensure_youtube_quota_ledger(day_key)
+        now = _utcnow().isoformat()
+        self._conn.execute(
+            """
+            UPDATE youtube_api_quota_ledger
+            SET exhausted_at = NULL, updated_at = ?
+            WHERE day_key = ?
+            """,
+            (now, day_key),
+        )
+        self._conn.commit()
+
+    def upsert_category_youtube_playlist_pending(
+        self, *, shortcode, priority, category="", url="", last_error=""
+    ):
+        now = _utcnow().isoformat()
+        priority = "new" if priority == "new" else "historic"
+        self._conn.execute(
+            """
+            INSERT INTO category_youtube_playlist_pending
+                (shortcode, priority, category, url, attempts, last_error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+            ON CONFLICT(shortcode) DO UPDATE SET
+                priority = CASE
+                    WHEN excluded.priority = 'new' THEN 'new'
+                    ELSE category_youtube_playlist_pending.priority
+                END,
+                category = COALESCE(NULLIF(excluded.category, ''), category_youtube_playlist_pending.category),
+                url = COALESCE(NULLIF(excluded.url, ''), category_youtube_playlist_pending.url),
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at
+            """,
+            (shortcode, priority, category or "", url or "", last_error or "", now, now),
+        )
+        self._conn.commit()
+
+    def list_category_youtube_playlist_pending(self, *, priority=None, limit=0):
+        if priority:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM category_youtube_playlist_pending
+                WHERE priority = ?
+                ORDER BY updated_at ASC
+                """,
+                (priority,),
+            ).fetchall()
+        else:
+            # New before historic
+            rows = self._conn.execute(
+                """
+                SELECT * FROM category_youtube_playlist_pending
+                ORDER BY CASE priority WHEN 'new' THEN 0 ELSE 1 END, updated_at ASC
+                """
+            ).fetchall()
+        out = [dict(r) for r in rows]
+        if limit and limit > 0:
+            return out[:limit]
+        return out
+
+    def bump_category_youtube_playlist_pending(self, shortcode, last_error=""):
+        now = _utcnow().isoformat()
+        self._conn.execute(
+            """
+            UPDATE category_youtube_playlist_pending SET
+                attempts = attempts + 1,
+                last_error = ?,
+                updated_at = ?
+            WHERE shortcode = ?
+            """,
+            (last_error or "", now, shortcode),
+        )
+        self._conn.commit()
+
+    def delete_category_youtube_playlist_pending(self, shortcode):
+        cur = self._conn.execute(
+            "DELETE FROM category_youtube_playlist_pending WHERE shortcode = ?",
+            (shortcode,),
         )
         self._conn.commit()
         return cur.rowcount > 0

@@ -57,5 +57,14 @@ enabled = false
 dry_run = true
 title_prefix = "SuperBrain — "
 privacy_status = "private"
+# Local quota ledger (Pacific day). Historic backfill uses ~10% until the
+# last near_reset_hours before midnight, then up to near_reset_historic_pct.
+daily_quota_units = 10000
+new_video_reserve_pct = 0.90
+near_reset_hours = 2
+near_reset_historic_pct = 0.90
+# Analyses newer than this window are treated as priority=new during backfill.
+fresh_window_hours = 24
+idle_sleep_seconds = 180
 # Leave empty / omit to sync all configured taxonomy categories.
 # categories = ["Sysadmin", "Science", "Technology", "History", "Humanities", "Politics", "Other"]
