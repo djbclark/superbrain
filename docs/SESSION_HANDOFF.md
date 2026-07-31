@@ -39,8 +39,7 @@ Recent work on `djbclark/superbrain` `main`:
 Runtime: `~/.superbrain-server`. Log:
 `~/Library/Logs/superbrain/category-playlist-backfill.log`.
 
-Still open on #5: multi-membership rows for add-only cleanup, hosted per-user
-budgets, automatic rebuild execution (intentionally not done — recommendation only).
+Fork #5 operator decisions (2026-07-31): playlist **rebuild execution** and **hosted per-user budgets** are deferred (later). Planner stays recommendation-only; self-hosted keeps a single-tenant local ledger until issues #1/#2.
 
 ## Upstream contribution sequence
 
