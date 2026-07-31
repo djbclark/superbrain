@@ -66,5 +66,8 @@ near_reset_historic_pct = 0.90
 # Analyses newer than this window are treated as priority=new during backfill.
 fresh_window_hours = 24
 idle_sleep_seconds = 180
+# "move" removes from the previous category playlist; "add_only" never
+# auto-deletes (playlists become cumulative/tag-like). Default stays "move".
+membership_mode = "move"
 # Leave empty / omit to sync all configured taxonomy categories.
 # categories = ["Sysadmin", "Science", "Technology", "History", "Humanities", "Politics", "Other"]

@@ -37,6 +37,7 @@ near_reset_hours = 2
 near_reset_historic_pct = 0.90
 fresh_window_hours = 24
 idle_sleep_seconds = 180
+membership_mode = "move"   # or "add_only"
 # categories = ["Sysadmin", "Science"]   # optional subset; omit = all taxonomy
 ```
 
@@ -48,8 +49,10 @@ idle_sleep_seconds = 180
 - On analyze (YouTube) and `PUT /post/{shortcode}` category edits: best-effort
   sync with **priority=new** (uses the new-video quota reserve)
 - On category change: remove from previous playlist, add to new (idempotent)
+  unless `membership_mode = "add_only"` (skips auto-delete; playlists become
+  cumulative — local mapping still tracks the primary category only)
 - **Playlist order:** inserts use `snippet.position = 0` so watchlists read
-  newest → oldest (add-only default UX)
+  newest → oldest (add-only default UX for ordering, not membership)
 - Skips non-YouTube, hidden, and labels outside the taxonomy
 - Bulk backfill is via CLI (not automatic on every `recategorize.py apply`)
 
@@ -109,7 +112,9 @@ superbrain --youtube-quota-stats --youtube-quota-stats-days 7
 Usage events are stored in `youtube_api_usage_events` (no tokens/headers/payloads)
 with a versioned cost table (`core/youtube_quota.py`, currently dated
 `2026-07-31`). Failed calls are still charged when the method cost is known.
-`--category-playlists-status` includes the same daily usage rollup.
+`--youtube-quota-stats` also prints a local-only reconcile-vs-rebuild planner
+(rebuild is never automatic; cheaper only when `deletions > retained + 2` per
+category under equal 50-unit write costs).
 
 Concurrent accidental runs are blocked with exclusive flock locks under
 `~/.superbrain-server/locks/` for `--youtube-connect`,

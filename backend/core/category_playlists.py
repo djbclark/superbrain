@@ -54,6 +54,8 @@ class PlaylistSyncConfig:
     near_reset_historic_pct: float = 0.90
     fresh_window_hours: float = 24.0
     idle_sleep_seconds: float = 180.0
+    # "move" = remove from previous category playlist; "add_only" = never auto-delete.
+    membership_mode: str = "move"
 
     def includes(self, category_name: str) -> bool:
         if self.categories is None:
@@ -136,6 +138,12 @@ def load_playlist_sync_config(path: Optional[Path] = None) -> PlaylistSyncConfig
         ),
         fresh_window_hours=max(0.0, _float("fresh_window_hours", 24.0)),
         idle_sleep_seconds=max(30.0, _float("idle_sleep_seconds", 180.0)),
+        membership_mode=(
+            "add_only"
+            if str(section.get("membership_mode", "move")).strip().lower()
+            == "add_only"
+            else "move"
+        ),
     )
 
 
@@ -173,6 +181,7 @@ def enable_playlist_sync_in_config(
         f"near_reset_historic_pct = {existing.near_reset_historic_pct}",
         f"fresh_window_hours = {existing.fresh_window_hours}",
         f"idle_sleep_seconds = {existing.idle_sleep_seconds}",
+        f'membership_mode = "{existing.membership_mode}"',
     ]
     if existing.categories:
         cats = ", ".join(f'"{c}"' for c in existing.categories)
@@ -743,6 +752,7 @@ def sync_video_category(
         existing
         and existing.get("playlist_item_id")
         and (not resolved or existing.get("category_name") != resolved)
+        and cfg.membership_mode != "add_only"
     )
     needs_add = bool(resolved)
     units_needed = 0
@@ -1112,6 +1122,131 @@ def _sync_one_row(
     )
 
 
+def plan_reconcile_vs_rebuild(
+    db,
+    *,
+    config: Optional[PlaylistSyncConfig] = None,
+) -> dict[str, Any]:
+    """
+    Dry-run quota comparison using local mapping state only (no YouTube list).
+
+    With equal 50-unit write costs, rebuild is cheaper than individual
+    reconciliation only when deletions > retained_items + 2 (per category).
+    Rebuild remains an explicit maintenance recommendation — never automatic.
+    """
+    cfg = config or load_playlist_sync_config()
+    write = UNITS_PLAYLIST_ITEM_INSERT  # insert == delete == playlist write
+    categories: dict[str, dict[str, Any]] = {}
+
+    desired_rows = db._conn.execute(
+        """
+        SELECT category, COUNT(*) AS n
+        FROM analyses
+        WHERE content_type = 'youtube'
+          AND COALESCE(is_hidden, 0) = 0
+          AND category IS NOT NULL
+          AND category != ''
+        GROUP BY category
+        """
+    ).fetchall()
+    desired_by_cat = {r["category"]: int(r["n"]) for r in desired_rows}
+
+    mapped_rows = db._conn.execute(
+        """
+        SELECT category_name, COUNT(*) AS n
+        FROM category_youtube_playlist_items
+        GROUP BY category_name
+        """
+    ).fetchall()
+    mapped_by_cat = {r["category_name"]: int(r["n"]) for r in mapped_rows}
+
+    # Approximate retained/additions/deletions from local shortcode∩category match.
+    match_rows = db._conn.execute(
+        """
+        SELECT a.category AS category,
+               COUNT(*) AS retained
+        FROM analyses a
+        JOIN category_youtube_playlist_items i
+          ON i.shortcode = a.shortcode
+         AND i.category_name = a.category
+        WHERE a.content_type = 'youtube'
+          AND COALESCE(a.is_hidden, 0) = 0
+          AND a.category IS NOT NULL
+          AND a.category != ''
+        GROUP BY a.category
+        """
+    ).fetchall()
+    retained_by_cat = {r["category"]: int(r["retained"]) for r in match_rows}
+
+    all_cats = sorted(set(desired_by_cat) | set(mapped_by_cat))
+    totals = {
+        "additions": 0,
+        "deletions": 0,
+        "retained": 0,
+        "reconcile_units": 0,
+        "rebuild_units": 0,
+        "categories_prefer_rebuild": 0,
+    }
+
+    for cat in all_cats:
+        if not cfg.includes(cat):
+            continue
+        desired = desired_by_cat.get(cat, 0)
+        mapped = mapped_by_cat.get(cat, 0)
+        retained = retained_by_cat.get(cat, 0)
+        additions = max(0, desired - retained)
+        deletions = max(0, mapped - retained)
+        # reconcile: 50*(add+del); list overhead omitted (cheap / unknown remotely)
+        reconcile_units = write * (additions + deletions)
+        # rebuild: delete playlist (50) + create (50) + insert desired (50*n)
+        rebuild_units = (
+            UNITS_PLAYLIST_INSERT
+            + UNITS_PLAYLIST_INSERT
+            + write * desired
+        )
+        # Formula: rebuild cheaper iff deletions > retained + 2
+        # (derived from 50*(add+del) vs 100+50*desired with desired=retained+add)
+        prefer_rebuild = deletions > (retained + 2)
+        margin_units = reconcile_units - rebuild_units
+        entry = {
+            "category": cat,
+            "desired": desired,
+            "mapped": mapped,
+            "retained": retained,
+            "additions": additions,
+            "deletions": deletions,
+            "reconcile_units": reconcile_units,
+            "rebuild_units": rebuild_units,
+            "prefer_rebuild": prefer_rebuild,
+            "savings_if_rebuild": max(0, margin_units),
+            "break_even_rule": "rebuild cheaper when deletions > retained + 2",
+        }
+        categories[cat] = entry
+        totals["additions"] += additions
+        totals["deletions"] += deletions
+        totals["retained"] += retained
+        totals["reconcile_units"] += reconcile_units
+        totals["rebuild_units"] += rebuild_units
+        if prefer_rebuild:
+            totals["categories_prefer_rebuild"] += 1
+
+    return {
+        "membership_mode": cfg.membership_mode,
+        "write_unit_cost": write,
+        "cost_table_note": (
+            "Uses local DB mappings only; remote drift requires an explicit "
+            "playlistItems.list reconciliation pass before acting on rebuild."
+        ),
+        "totals": totals,
+        "categories": categories,
+        "recommendation": (
+            "Treat rebuild as an explicit, separately consented maintenance "
+            "operation — never automatic. Prefer reconcile unless a category "
+            "shows meaningful savings and the operator accepts a new playlist ID."
+        ),
+    }
+
+
 def print_youtube_quota_stats(*, days: int = 1) -> int:
     """CLI: print durable YouTube API usage statistics."""
     import json
@@ -1128,6 +1263,7 @@ def print_youtube_quota_stats(*, days: int = 1) -> int:
             cfg = load_playlist_sync_config()
             unsynced = len(fetch_unsynced_playlist_rows(db))
             planned_insert_units = unsynced * UNITS_PLAYLIST_ITEM_INSERT
+            strategy = plan_reconcile_vs_rebuild(db, config=cfg)
             summary["planner"] = {
                 "unsynced_videos": unsynced,
                 "estimated_insert_units": planned_insert_units,
@@ -1136,15 +1272,18 @@ def print_youtube_quota_stats(*, days: int = 1) -> int:
                     if unsynced
                     else 0
                 ),
+                "membership_mode": cfg.membership_mode,
                 "note": (
-                    "Add-only estimate assumes one playlistItems.insert (50 units) "
-                    "per unsynced video; excludes list/ensure overhead and moves."
+                    "Unsynced estimate assumes one playlistItems.insert (50 units) "
+                    "per video; excludes list/ensure overhead and moves."
                 ),
+                "reconcile_vs_rebuild": strategy,
             }
             summary["config_budget"] = {
                 "daily_quota_units": cfg.daily_quota_units,
                 "historic_normal_cap": cfg.historic_normal_cap,
                 "near_reset_total_cap": cfg.near_reset_total_cap,
+                "membership_mode": cfg.membership_mode,
                 "cost_table_version": COST_TABLE_VERSION,
                 "cost_table_source": COST_TABLE_SOURCE,
             }

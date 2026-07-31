@@ -403,6 +403,106 @@ class TestQuotaBudget(unittest.TestCase):
         self.assertEqual(priority_for_analysis_row(cfg, fresh, now=now), "new")
         self.assertEqual(priority_for_analysis_row(cfg, old, now=now), "historic")
 
+    def test_add_only_skips_remove(self):
+        clear_taxonomy_cache()
+        cfg_path = Path(self.tmp.name) / "categories.toml"
+        cfg_path.write_text(TOML, encoding="utf-8")
+        cfg = load_playlist_sync_config(cfg_path)
+        cfg = PlaylistSyncConfig(
+            enabled=True,
+            dry_run=False,
+            title_prefix=cfg.title_prefix,
+            config_path=cfg_path,
+            membership_mode="add_only",
+        )
+        self.db.save_analysis(
+            shortcode="YT_addonlyvid1",
+            url="https://www.youtube.com/watch?v=addonlyvid1",
+            username="u",
+            title="t",
+            summary="s",
+            tags=[],
+            music="",
+            category="Sysadmin",
+            content_type="youtube",
+        )
+        self.db.upsert_category_youtube_playlist(
+            "Sysadmin", "PL_sys", "SB — Sysadmin"
+        )
+        self.db.upsert_category_youtube_playlist(
+            "Other", "PL_other", "SB — Other"
+        )
+        self.db.upsert_category_youtube_playlist_item(
+            video_id="addonlyvid1",
+            shortcode="YT_addonlyvid1",
+            category_name="Sysadmin",
+            playlist_id="PL_sys",
+            playlist_item_id="item_old",
+        )
+        client = MagicMock()
+        client.add_video.side_effect = (
+            lambda playlist_id, video_id, position=0: f"item_{playlist_id}"
+        )
+        out = sync_video_category(
+            self.db,
+            shortcode="YT_addonlyvid1",
+            url="https://www.youtube.com/watch?v=addonlyvid1",
+            new_category="Other",
+            config=cfg,
+            client=client,
+            priority="new",
+            ensure_playlists=False,
+        )
+        self.assertTrue(out["ok"])
+        client.remove_playlist_item.assert_not_called()
+        client.add_video.assert_called_with("PL_other", "addonlyvid1", position=0)
+
+    def test_reconcile_vs_rebuild_break_even(self):
+        from core.category_playlists import plan_reconcile_vs_rebuild
+
+        clear_taxonomy_cache()
+        cfg_path = Path(self.tmp.name) / "cat.toml"
+        cfg_path.write_text(TOML, encoding="utf-8")
+        cfg = load_playlist_sync_config(cfg_path)
+        # Desired: 2 videos in Sysadmin. Mapped: 5 stale + 2 retained → deletions=5, retained=2
+        # prefer_rebuild when deletions > retained+2 → 5 > 4 → True
+        for i, vid in enumerate(["aaaaaaaaaaa", "bbbbbbbbbbb"]):
+            sc = f"YT_{vid}"
+            self.db.save_analysis(
+                shortcode=sc,
+                url=f"https://www.youtube.com/watch?v={vid}",
+                username="u",
+                title="t",
+                summary="s",
+                tags=[],
+                music="",
+                category="Sysadmin",
+                content_type="youtube",
+            )
+            self.db.upsert_category_youtube_playlist_item(
+                video_id=vid,
+                shortcode=sc,
+                category_name="Sysadmin",
+                playlist_id="PL_sys",
+                playlist_item_id=f"keep_{i}",
+            )
+        for i in range(5):
+            vid = f"stale{i:07d}"
+            self.db.upsert_category_youtube_playlist_item(
+                video_id=vid,
+                shortcode=f"YT_{vid}",
+                category_name="Sysadmin",
+                playlist_id="PL_sys",
+                playlist_item_id=f"stale_{i}",
+            )
+        plan = plan_reconcile_vs_rebuild(self.db, config=cfg)
+        sysadmin = plan["categories"]["Sysadmin"]
+        self.assertEqual(sysadmin["retained"], 2)
+        self.assertEqual(sysadmin["deletions"], 5)
+        self.assertEqual(sysadmin["additions"], 0)
+        self.assertTrue(sysadmin["prefer_rebuild"])
+        self.assertGreater(sysadmin["savings_if_rebuild"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
