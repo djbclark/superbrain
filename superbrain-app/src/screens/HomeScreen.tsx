@@ -309,18 +309,15 @@ const HomeScreen = () => {
         const merged = [...analyzingPlaceholders, ...localPosts];
         setPosts(merged);
         setLoading(false);
-
-        // If not forcing refresh and no analyzing posts, we're done
-        if (!forceRefresh && analyzingShortcodes.length === 0) {
-          return;
-        }
+        // Do not return early: always continue to background sync so server-side
+        // recategorizations / taxonomy cuts reach the device.
       } else {
         // No local data at all — show loading spinner
         setLoading(true);
       }
 
       // ── Step 2: Background sync with backend ──
-      // This runs non-blocking: UI is already showing local data (if any)
+      // UI may already be showing local data; refresh if sync changes anything.
       const isOnline = await apiService.testConnection().catch(() => false);
 
       if (isOnline) {
@@ -328,11 +325,12 @@ const HomeScreen = () => {
         await postsCache.flushPendingPostMutations();
         await postsCache.flushPendingAnalyses();
 
-        // Delta or full sync depending on DB state
-        const dataChanged = await syncService.syncIfNeeded();
+        // Delta or full sync depending on DB state / pull-to-refresh
+        const dataChanged = await syncService.syncIfNeeded(forceRefresh);
 
         // If sync brought new data, re-read from local DB and update UI
         if (dataChanged || forceRefresh) {
+          await loadCategories();
           const freshPosts = await localDb.getAllPosts();
           if (freshPosts.length > 0) {
             // Clear analyzing state for posts that now exist in the synced data
@@ -421,6 +419,7 @@ const HomeScreen = () => {
 
   const onRefresh = async () => {
     setRefreshing(true);
+    await loadCategories();
     await loadPosts(true); // Force refresh from server
     setRefreshing(false);
   };
