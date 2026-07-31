@@ -29,11 +29,25 @@ def pull(number, *, state="open", merged=False, events=None, updated_at=None):
     }
 
 
-def snapshot(pulls, *, meta=None, biome_ready=True, biome_open=False):
+def issue(number, *, state="open", events=None, updated_at=None):
+    return {
+        "repo": "sidinsearch/superbrain",
+        "number": number,
+        "label": f"Issue {number}",
+        "title": f"Issue {number}",
+        "url": f"https://github.com/sidinsearch/superbrain/issues/{number}",
+        "state": state,
+        "updated_at": updated_at or "2026-07-31T12:00:00Z",
+        "events": events or {},
+    }
+
+
+def snapshot(pulls, *, issues=None, meta=None, biome_ready=True, biome_open=False):
     return {
         "version": 1,
         "collected_at": "2026-07-31T13:00:00+00:00",
         "pulls": pulls,
+        "issues": issues or [],
         "biome_branch_ready": biome_ready,
         "biome_pr_open": biome_open,
         "meta": meta or {},
@@ -73,6 +87,41 @@ class TrackerTests(unittest.TestCase):
         self.assertTrue(notify)
         self.assertIn("new comment by @sidinsearch", message)
         self.assertIn("reply if needed", message)
+
+    def test_external_proposal_comment_requests_attention(self):
+        old = snapshot(
+            [pull(4), pull(5)],
+            issues=[issue(6)],
+            meta={"last_action_key": "waiting", "last_stale_nudges": {}},
+        )
+        event = {
+            "kind": "comment",
+            "author": "sidinsearch",
+            "author_type": "User",
+            "url": "https://example.invalid/comment",
+            "timestamp": "2026-07-31T12:30:00Z",
+            "state": "",
+            "fingerprint": "new",
+        }
+        current = snapshot(
+            [pull(4), pull(5)],
+            issues=[issue(6, events={"comment:1": event})],
+        )
+        notify, message = tracker.compare_snapshots(
+            old, current, self.now, force=False, scheduled=True
+        )
+        self.assertTrue(notify)
+        self.assertIn("Issue #6: new comment by @sidinsearch", message)
+        self.assertIn("reply if needed", message)
+
+    def test_waiting_status_includes_proposal(self):
+        current = snapshot([pull(4), pull(5)], issues=[issue(6)])
+        notify, message = tracker.compare_snapshots(
+            None, current, self.now, force=True, scheduled=False
+        )
+        self.assertTrue(notify)
+        self.assertIn("PRs #4, #5 and proposal #6", message)
+        self.assertIn("Issue #6", message)
 
     def test_merged_pr_opens_biome_submission_slot(self):
         old = snapshot(

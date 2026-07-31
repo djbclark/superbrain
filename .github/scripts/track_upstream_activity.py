@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Track upstream SuperBrain pull requests and emit Telegram-ready nudges."""
+"""Track upstream SuperBrain pull requests/issues and emit Telegram-ready nudges."""
 
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ SELF_LOGINS = {"djbclark"}
 BIOME_BRANCH = "prep/biome-tooling"
 STALE_AFTER = timedelta(days=3)
 STALE_REPEAT = timedelta(days=3)
+ISSUE_STALE_AFTER = timedelta(days=7)
+ISSUE_STALE_REPEAT = timedelta(days=7)
 TRACKED_PULLS = (
     {
         "repo": "sidinsearch/superbrain",
@@ -33,6 +35,13 @@ TRACKED_PULLS = (
         "repo": "sidinsearch/superbrain",
         "number": 5,
         "label": "Mobile delta-sync pagination",
+    },
+)
+TRACKED_ISSUES = (
+    {
+        "repo": "sidinsearch/superbrain",
+        "number": 6,
+        "label": "YouTube subscription organization proposal",
     },
 )
 
@@ -144,6 +153,26 @@ def collect_pull(client: GitHubClient, spec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def collect_issue(client: GitHubClient, spec: dict[str, Any]) -> dict[str, Any]:
+    repo = spec["repo"]
+    number = spec["number"]
+    issue = client.get(f"/repos/{repo}/issues/{number}")
+    comments = client.get_all(f"/repos/{repo}/issues/{number}/comments")
+    events = {
+        f"comment:{item['id']}": event_record("comment", item) for item in comments
+    }
+    return {
+        "repo": repo,
+        "number": number,
+        "label": spec["label"],
+        "title": issue.get("title") or spec["label"],
+        "url": issue.get("html_url") or f"https://github.com/{repo}/issues/{number}",
+        "state": issue.get("state") or "unknown",
+        "updated_at": issue.get("updated_at") or "",
+        "events": events,
+    }
+
+
 def collect_snapshot(client: GitHubClient) -> dict[str, Any]:
     encoded_branch = urllib.parse.quote(BIOME_BRANCH, safe="")
     biome_branch_ready = client.exists(
@@ -169,6 +198,7 @@ def collect_snapshot(client: GitHubClient) -> dict[str, Any]:
         "version": 1,
         "collected_at": utcnow().isoformat(),
         "pulls": pulls,
+        "issues": [collect_issue(client, spec) for spec in TRACKED_ISSUES],
         "biome_branch_ready": biome_branch_ready,
         "biome_pr_open": bool(biome_pulls and biome_pulls[0]["state"] == "open"),
         "meta": {},
@@ -209,10 +239,16 @@ def compare_snapshots(
     previous_pulls = {
         pull["number"]: pull for pull in (previous or {}).get("pulls", [])
     }
+    previous_issues = {
+        issue["number"]: issue for issue in (previous or {}).get("issues", [])
+    }
     previous_meta = (previous or {}).get("meta") or {}
     current_meta = {
         "last_action_key": previous_meta.get("last_action_key", "waiting"),
         "last_stale_nudges": dict(previous_meta.get("last_stale_nudges") or {}),
+        "last_issue_stale_nudges": dict(
+            previous_meta.get("last_issue_stale_nudges") or {}
+        ),
     }
 
     if previous:
@@ -248,6 +284,35 @@ def compare_snapshots(
                         f"✏️ PR #{pull['number']}: {event['kind']} edited by @{event['author']}"
                     )
 
+        for issue in current["issues"]:
+            old = previous_issues.get(issue["number"])
+            if not old:
+                changes.append(f"➕ Now tracking upstream issue #{issue['number']}")
+                continue
+
+            if old["state"] != issue["state"]:
+                external_activity = True
+                changes.append(
+                    f"🔄 Issue #{issue['number']} changed: "
+                    f"{old['state']} → {issue['state']}"
+                )
+
+            old_events = old.get("events") or {}
+            for event_id, event in issue["events"].items():
+                if event["author"] in SELF_LOGINS:
+                    continue
+                old_event = old_events.get(event_id)
+                if old_event is None:
+                    external_activity = True
+                    changes.append(
+                        f"💬 Issue #{issue['number']}: new comment by @{event['author']}"
+                    )
+                elif old_event.get("fingerprint") != event["fingerprint"]:
+                    external_activity = True
+                    changes.append(
+                        f"✏️ Issue #{issue['number']}: comment edited by @{event['author']}"
+                    )
+
     changes_requested: list[int] = []
     for pull in current["pulls"]:
         if "changes_requested" in latest_review_states(pull).values():
@@ -260,6 +325,7 @@ def compare_snapshots(
     open_foundation_pulls = [
         pull for pull in open_pulls if pull["number"] in foundation_numbers
     ]
+    open_issues = [issue for issue in current["issues"] if issue["state"] == "open"]
     if changes_requested:
         joined = ", ".join(f"#{number}" for number in changes_requested)
         action_key = f"changes-requested:{joined}"
@@ -276,9 +342,19 @@ def compare_snapshots(
         next_action = "A PR slot is open: rebase and submit prep/biome-tooling."
     else:
         action_key = "waiting"
-        if open_pulls:
-            numbers = ", ".join(f"#{pull['number']}" for pull in open_pulls)
-            next_action = f"Wait for upstream review on open PRs {numbers}."
+        if open_pulls and open_issues:
+            pull_numbers = ", ".join(f"#{pull['number']}" for pull in open_pulls)
+            issue_numbers = ", ".join(f"#{issue['number']}" for issue in open_issues)
+            next_action = (
+                f"Wait for upstream review on PRs {pull_numbers} "
+                f"and proposal {issue_numbers}."
+            )
+        elif open_pulls:
+            pull_numbers = ", ".join(f"#{pull['number']}" for pull in open_pulls)
+            next_action = f"Wait for upstream review on open PRs {pull_numbers}."
+        elif open_issues:
+            issue_numbers = ", ".join(f"#{issue['number']}" for issue in open_issues)
+            next_action = f"Wait for upstream feedback on proposal {issue_numbers}."
         else:
             next_action = "Review the contribution roadmap and select the next upstream-safe wave."
 
@@ -304,6 +380,22 @@ def compare_snapshots(
                 )
                 current_meta["last_stale_nudges"][nudge_key] = now.isoformat()
 
+        for issue in open_issues:
+            updated_at = parse_timestamp(issue["updated_at"])
+            if updated_at is None or now - updated_at < ISSUE_STALE_AFTER:
+                continue
+            nudge_key = str(issue["number"])
+            last_nudge = parse_timestamp(
+                current_meta["last_issue_stale_nudges"].get(nudge_key)
+            )
+            if last_nudge is None or now - last_nudge >= ISSUE_STALE_REPEAT:
+                age_days = (now - updated_at).days
+                changes.append(
+                    f"⏰ Issue #{issue['number']} has had no activity for {age_days} days; "
+                    "consider a concise follow-up."
+                )
+                current_meta["last_issue_stale_nudges"][nudge_key] = now.isoformat()
+
     current["meta"] = current_meta
     should_notify = bool(changes) or force
 
@@ -319,6 +411,14 @@ def compare_snapshots(
         label = html.escape(pull["label"])
         lines.append(
             f'<a href="{html.escape(pull["url"], quote=True)}">PR #{pull["number"]}</a>: '
+            f"<b>{status}</b> — {label}"
+        )
+
+    for issue in current["issues"]:
+        status = html.escape(issue["state"])
+        label = html.escape(issue["label"])
+        lines.append(
+            f'<a href="{html.escape(issue["url"], quote=True)}">Issue #{issue["number"]}</a>: '
             f"<b>{status}</b> — {label}"
         )
 
