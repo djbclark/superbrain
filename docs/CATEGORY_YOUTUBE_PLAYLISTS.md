@@ -102,7 +102,11 @@ superbrain --sync-category-playlists --sync-category-playlists-limit 20
 
 `superbrain --sync-category-playlists`:
 
-1. Ensures playlists once (budget-aware).
+1. Ensures playlists once (budget-aware). Skips `playlists.list` when local
+   mappings already cover every category, when the Pacific day is marked
+   exhausted, or when a successful list already ran today
+   (`playlists_listed_at` on the quota ledger). Use `force_list=True` only from
+   explicit maintenance callers.
 2. Drains pending **new** first, then pending historic.
 3. Syncs unsynced rows **newest-first** (`analyzed_at`, then `categorized_at`,
    then `updated_at`).

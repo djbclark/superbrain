@@ -341,6 +341,9 @@ class Database:
                 ON category_youtube_playlist_pending (priority, updated_at);
         """)
         self._conn.commit()
+        self._add_column_if_missing(
+            "youtube_api_quota_ledger", "playlists_listed_at", "TEXT"
+        )
 
         # Durable YouTube Data API usage events (no tokens/headers/payloads)
         self._conn.executescript("""
@@ -1651,6 +1654,20 @@ class Database:
             (now, day_key),
         )
         self._conn.commit()
+
+    def mark_youtube_playlists_listed(self, day_key, when=None):
+        self.ensure_youtube_quota_ledger(day_key)
+        stamp = when or _utcnow().isoformat()
+        self._conn.execute(
+            """
+            UPDATE youtube_api_quota_ledger
+            SET playlists_listed_at = ?, updated_at = ?
+            WHERE day_key = ?
+            """,
+            (stamp, stamp, day_key),
+        )
+        self._conn.commit()
+        return self.get_youtube_quota_ledger(day_key)
 
     def upsert_category_youtube_playlist_pending(
         self, *, shortcode, priority, category="", url="", last_error=""

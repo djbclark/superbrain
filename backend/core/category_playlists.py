@@ -583,8 +583,18 @@ def ensure_category_playlists(
     taxonomy=None,
     client: Optional[YouTubePlaylistClient] = None,
     priority: str = "historic",
+    force_list: bool = False,
 ) -> dict[str, Any]:
-    """Create or adopt YouTube playlists for each synced taxonomy category."""
+    """
+    Create or adopt YouTube playlists for each synced taxonomy category.
+
+    Thrift rules for playlists.list:
+    - Skip remote list when every category already has a local mapping
+      (unless force_list=True).
+    - List at most once per Pacific day (ledger.playlists_listed_at).
+    - Never call list when the day is already marked exhausted; use local
+      mappings only and report quota_exhausted if anything is still missing.
+    """
     cfg = config or load_playlist_sync_config()
     tax = _load_taxonomy(cfg, taxonomy)
     actions: list[dict[str, Any]] = []
@@ -594,10 +604,79 @@ def ensure_category_playlists(
     names = [c.name for c in tax.categories if cfg.includes(c.name)]
     # Prefer user categories only when defaults are disabled (this deployment).
     if not tax.use_default_categories:
-        names = [c.name for c in tax.categories if c.source == "user" and cfg.includes(c.name)]
+        names = [
+            c.name
+            for c in tax.categories
+            if c.source == "user" and cfg.includes(c.name)
+        ]
+
+    day = pacific_day_key()
+    ledger = db.ensure_youtube_quota_ledger(day) or {}
+    exhausted = bool(ledger.get("exhausted_at"))
+    listed_today = bool(ledger.get("playlists_listed_at"))
+
+    missing = [
+        name
+        for name in names
+        if not (db.get_category_youtube_playlist(name) or {}).get("playlist_id")
+    ]
+
+    # Fast path: everything already mapped locally — no list call.
+    if not missing and not force_list:
+        for name in names:
+            mapped = db.get_category_youtube_playlist(name)
+            actions.append(
+                {
+                    "category": name,
+                    "action": "mapped",
+                    "playlist_id": mapped["playlist_id"],
+                    "title": mapped.get("title") or cfg.playlist_title(name),
+                }
+            )
+        return {
+            "ok": True,
+            "dry_run": cfg.dry_run,
+            "skipped": "local_mappings",
+            "list_skipped": True,
+            "actions": actions,
+        }
+
+    if exhausted and not cfg.dry_run:
+        # Do not burn quota (or hit 403 again) listing while exhausted.
+        for name in names:
+            mapped = db.get_category_youtube_playlist(name)
+            if mapped and mapped.get("playlist_id"):
+                actions.append(
+                    {
+                        "category": name,
+                        "action": "mapped",
+                        "playlist_id": mapped["playlist_id"],
+                        "title": mapped.get("title") or cfg.playlist_title(name),
+                    }
+                )
+            else:
+                actions.append(
+                    {
+                        "category": name,
+                        "action": "skipped_quota_exhausted",
+                        "title": cfg.playlist_title(name),
+                    }
+                )
+        return {
+            "ok": not missing,
+            "skipped": "quota_exhausted",
+            "list_skipped": True,
+            "missing": missing,
+            "actions": actions,
+        }
 
     existing_by_title: dict[str, str] = {}
     yt = client
+    need_list = (bool(missing) or force_list) and not cfg.dry_run
+    # At most one successful list per Pacific day unless forced.
+    if need_list and listed_today and not force_list:
+        need_list = False
+
     if not cfg.dry_run:
         yt = yt or YouTubePlaylistClient(
             db=db,
@@ -610,16 +689,23 @@ def ensure_category_playlists(
             yt.operation = "ensure_playlists"
         if hasattr(yt, "_db") and getattr(yt, "_db", None) is None:
             yt._db = db
+
+    listed_this_call = False
+    if need_list:
         if not can_spend_quota(db, cfg, priority=priority, units=UNITS_PLAYLIST_LIST):
             return {
                 "ok": False,
                 "skipped": "quota_budget",
+                "list_skipped": True,
                 "actions": actions,
             }
+        assert yt is not None
         try:
             for pl in yt.list_my_playlists():
                 if pl["title"] and pl["playlist_id"]:
                     existing_by_title[pl["title"]] = pl["playlist_id"]
+            db.mark_youtube_playlists_listed(day)
+            listed_this_call = True
         except Exception as exc:
             if is_youtube_quota_error(exc):
                 mark_day_exhausted(db)
@@ -676,7 +762,7 @@ def ensure_category_playlists(
                     }
                 raise
             action = "created"
-        if not cfg.dry_run and not playlist_id.startswith("dryrun-"):
+        if not cfg.dry_run and not str(playlist_id).startswith("dryrun-"):
             db.upsert_category_youtube_playlist(name, playlist_id, title)
         actions.append(
             {
@@ -687,7 +773,13 @@ def ensure_category_playlists(
                 "dry_run": cfg.dry_run,
             }
         )
-    return {"ok": True, "dry_run": cfg.dry_run, "actions": actions}
+    return {
+        "ok": True,
+        "dry_run": cfg.dry_run,
+        "list_skipped": not listed_this_call,
+        "listed_this_call": listed_this_call,
+        "actions": actions,
+    }
 
 
 def sync_video_category(
@@ -1561,10 +1653,33 @@ def backfill_category_playlists(
                     ensure = ensure_category_playlists(
                         db, config=cfg, priority="historic"
                     )
+                    # Exhausted day with list skipped: idle in main loop (no 403 storm).
+                    if ensure.get("list_skipped") and ensure.get("skipped") in {
+                        "quota_exhausted",
+                        "local_mappings",
+                    }:
+                        if ensure.get("skipped") == "quota_exhausted":
+                            print(
+                                "ensure: using local mappings only "
+                                "(day exhausted; playlists.list skipped)",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                "ensure: all category playlists already mapped locally "
+                                "(playlists.list skipped)",
+                                flush=True,
+                            )
+                        break
                     if ensure.get("skipped") == "quota_exhausted" and wait_for_quota:
                         sleep_until_youtube_quota_reset()
                         db.clear_youtube_quota_exhausted(pacific_day_key())
                         continue
+                    if ensure.get("list_skipped"):
+                        print(
+                            f"ensure: list_skipped skipped={ensure.get('skipped')}",
+                            flush=True,
+                        )
                     break
                 except Exception as exc:
                     if wait_for_quota and is_youtube_quota_error(exc):
@@ -1573,6 +1688,9 @@ def backfill_category_playlists(
                         db.clear_youtube_quota_exhausted(pacific_day_key())
                         continue
                     raise
+
+            if ensure is None:
+                ensure = {"ok": True, "actions": []}
 
             ok = skipped = failed = 0
             processed = 0

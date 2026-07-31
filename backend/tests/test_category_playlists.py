@@ -118,6 +118,60 @@ class TestPlaylistSync(unittest.TestCase):
             "PL_SB — Sysadmin",
         )
 
+    def test_ensure_skips_list_when_mappings_exist(self):
+        client = MagicMock()
+        self.db.upsert_category_youtube_playlist(
+            "Sysadmin", "PL_sys", "SB — Sysadmin"
+        )
+        self.db.upsert_category_youtube_playlist(
+            "Other", "PL_other", "SB — Other"
+        )
+        out = ensure_category_playlists(self.db, config=self.cfg, client=client)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out.get("skipped"), "local_mappings")
+        self.assertTrue(out.get("list_skipped"))
+        client.list_my_playlists.assert_not_called()
+
+    def test_ensure_skips_list_when_day_exhausted(self):
+        from core.category_playlists import pacific_day_key
+
+        client = MagicMock()
+        day = pacific_day_key()
+        self.db.mark_youtube_quota_exhausted(day)
+        # Missing Other mapping would previously force a list.
+        self.db.upsert_category_youtube_playlist(
+            "Sysadmin", "PL_sys", "SB — Sysadmin"
+        )
+        out = ensure_category_playlists(self.db, config=self.cfg, client=client)
+        self.assertEqual(out.get("skipped"), "quota_exhausted")
+        self.assertTrue(out.get("list_skipped"))
+        client.list_my_playlists.assert_not_called()
+        client.create_playlist.assert_not_called()
+
+    def test_ensure_lists_at_most_once_per_day(self):
+        from core.category_playlists import pacific_day_key
+
+        client = MagicMock()
+        client.list_my_playlists.return_value = []
+        client.last_list_pages = 1
+        client.create_playlist.side_effect = lambda title, privacy: f"PL_{title}"
+        first = ensure_category_playlists(self.db, config=self.cfg, client=client)
+        self.assertTrue(first["ok"])
+        self.assertTrue(first.get("listed_this_call"))
+        self.assertEqual(client.list_my_playlists.call_count, 1)
+        # Clear mappings so a naive ensure would want to list again.
+        self.db._conn.execute("DELETE FROM category_youtube_playlists")
+        self.db._conn.commit()
+        second = ensure_category_playlists(self.db, config=self.cfg, client=client)
+        self.assertEqual(client.list_my_playlists.call_count, 1)
+        self.assertTrue(second.get("list_skipped"))
+        # Creates still allowed without re-list.
+        self.assertTrue(
+            any(a.get("action") == "created" for a in second.get("actions", []))
+        )
+        ledger = self.db.get_youtube_quota_ledger(pacific_day_key())
+        self.assertTrue(ledger.get("playlists_listed_at"))
+
     def test_sync_add_and_move(self):
         client = MagicMock()
         client.list_my_playlists.return_value = []
