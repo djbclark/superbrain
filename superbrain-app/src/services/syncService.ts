@@ -10,6 +10,7 @@
 import localDb from './localDb';
 import apiService from './api';
 import { Post } from '../types';
+import { TaxonomyPayload, isTaxonomyApiActive } from './taxonomySupport';
 
 const BATCH_SIZE = 200; // posts per batch during full sync
 
@@ -107,14 +108,51 @@ async function deltaSync(): Promise<number> {
 /**
  * Decides whether to do a full or delta sync.
  * - Empty local DB → full sync
+ * - forceFull → full sync only when GET /taxonomy is active (taxonomy-aware
+ *   servers / pull-to-refresh after migrations). Without taxonomy, forceFull
+ *   is ignored so behavior matches upstream mainline (delta only).
+ * - taxonomy_version change → full sync (no-op when endpoint absent)
  * - Has data → delta sync
+ *
+ * Accepts an optional pre-fetched taxonomy payload so callers that already
+ * fetched GET /taxonomy do not trigger a redundant round-trip.
  * Returns true if any data changed.
  */
-async function syncIfNeeded(): Promise<boolean> {
+async function syncIfNeeded(
+  forceFull: boolean = false,
+  prefetchedTaxonomy?: TaxonomyPayload | null,
+): Promise<boolean> {
   try {
     const empty = await localDb.isEmpty();
-    if (empty) {
+    let taxonomyChanged = false;
+    let taxonomyVersion = '';
+    let taxonomyActive = false;
+    try {
+      const taxonomy = prefetchedTaxonomy !== undefined
+        ? prefetchedTaxonomy
+        : await apiService.getTaxonomy();
+      taxonomyActive = isTaxonomyApiActive(taxonomy);
+      taxonomyVersion = taxonomyActive ? (taxonomy?.taxonomy_version || '') : '';
+      if (taxonomyVersion) {
+        const localVersion = await localDb.getSyncMeta('taxonomy_version');
+        taxonomyChanged = localVersion !== taxonomyVersion;
+        if (taxonomyChanged) {
+          console.log(
+            `[Sync] Taxonomy version changed (${localVersion || 'none'} → ${taxonomyVersion}); forcing full sync`
+          );
+        }
+      }
+    } catch {
+      /* offline / taxonomy endpoint unavailable — upstream path */
+    }
+
+    const effectiveForceFull = forceFull && taxonomyActive;
+
+    if (empty || effectiveForceFull || taxonomyChanged) {
       const count = await fullSync();
+      if (taxonomyVersion) {
+        await localDb.setSyncMeta('taxonomy_version', taxonomyVersion);
+      }
       return count > 0;
     } else {
       const changes = await deltaSync();

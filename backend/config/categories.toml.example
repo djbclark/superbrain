@@ -6,6 +6,10 @@
 # file under ~/.superbrain-server/config/categories.toml is safe from deploys.
 
 [taxonomy]
+# false = only the [[categories]] list below is the taxonomy. Built-in
+# defaults (product, places, food, software, book, …) are not used for
+# classification and must not appear as client filter/edit chips.
+# true  = merge built-in defaults with any [[categories]] you add.
 use_default_categories = false
 allow_multiple_categories = false
 fallback_category = "Other"

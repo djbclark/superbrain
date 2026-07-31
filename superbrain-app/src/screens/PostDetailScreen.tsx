@@ -13,15 +13,19 @@ import { collectionsService } from '../services/collections';
 import { Collection } from '../types';
 import { schedulePostWatchLaterNotification, sendImmediateWatchLaterNotification, sendImmediateSavedNotification } from '../services/notificationService';
 import { getCollectionIconName, getCollectionIconColor } from '../constants/icons';
-import { DEFAULT_CATEGORIES, CATEGORY_ICONS } from '../constants/categories';
+import { BUILTIN_DEFAULT_CATEGORIES, CATEGORY_ICONS } from '../constants/categories';
+import { isTaxonomyApiActive } from '../services/taxonomySupport';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'PostDetail'>;
 
 type CategoryOption = { id: string; name: string; icon: string };
 
-const FALLBACK_CATEGORIES: CategoryOption[] = DEFAULT_CATEGORIES
-  .filter(c => c.id !== 'all')
-  .map(c => ({ id: c.id, name: c.name, icon: c.icon }));
+/** Upstream / no-taxonomy edit list (built-in mainline categories). */
+const FALLBACK_CATEGORIES: CategoryOption[] = BUILTIN_DEFAULT_CATEGORIES.map(c => ({
+  id: c.id,
+  name: c.name,
+  icon: c.icon,
+}));
 
 const PostDetailScreen = ({ route, navigation }: Props) => {
   const { post } = route.params;
@@ -56,21 +60,10 @@ const PostDetailScreen = ({ route, navigation }: Props) => {
       try {
         const taxonomy = await apiService.getTaxonomy();
         if (cancelled) return;
-        if (taxonomy && taxonomy.categories.length > 0) {
+        // Only replace the built-in picker when the server exposes taxonomy.
+        if (isTaxonomyApiActive(taxonomy)) {
           setCategoryOptions(
-            taxonomy.categories.map(c => ({
-              id: c.id,
-              name: c.name,
-              icon: CATEGORY_ICONS[c.id] || CATEGORY_ICONS[c.name.trim().toLowerCase()] || 'pricetag',
-            }))
-          );
-          return;
-        }
-        const cats = await apiService.getCategories();
-        if (cancelled) return;
-        if (cats && cats.length > 0) {
-          setCategoryOptions(
-            cats.map(c => ({
+            taxonomy!.categories.map(c => ({
               id: c.id,
               name: c.name,
               icon: CATEGORY_ICONS[c.id] || CATEGORY_ICONS[c.name.trim().toLowerCase()] || 'pricetag',
@@ -78,7 +71,7 @@ const PostDetailScreen = ({ route, navigation }: Props) => {
           );
         }
       } catch {
-        // Keep FALLBACK_CATEGORIES
+        // Keep FALLBACK_CATEGORIES (upstream path)
       }
     })();
     return () => {
