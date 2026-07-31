@@ -53,7 +53,12 @@ Reviewed and all findings fixed (deduplicated taxonomy HTTP calls, deferred
 taxonomy gate behind connectivity check, unconditional version persist).
 TypeScript passes.
 
-**Status:** Submitted to upstream. (Previous fork draft PR #6 closed).
+**Status:** OPEN on upstream (reopened 2026-07-31 after accidental close).
+Merged into **fork** `main` only — that does **not** close the upstream PR.
+Keep branch `djbclark/superbrain:draft/android-category-sync` published until
+upstream merges #7 (deleting the head branch prevents reopen).
+
+Fork draft PR #6 was closed after the fork merge (expected).
 
 ## Upstream contribution sequence
 
