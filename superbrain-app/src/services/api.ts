@@ -419,6 +419,7 @@ class ApiService {
     allow_multiple_categories: boolean;
     fallback_category: string;
     use_default_categories: boolean;
+    taxonomy_version: string;
   } | null> {
     try {
       const headers = await this.getHeaders();
@@ -429,6 +430,7 @@ class ApiService {
         allow_multiple_categories: boolean;
         fallback_category: string;
         use_default_categories: boolean;
+        taxonomy_version?: string;
       }>(
         `${baseUrl}/taxonomy`,
         { headers, timeout: DEFAULT_TIMEOUT }
@@ -439,6 +441,7 @@ class ApiService {
         allow_multiple_categories: !!response.data.allow_multiple_categories,
         fallback_category: response.data.fallback_category || 'Other',
         use_default_categories: !!response.data.use_default_categories,
+        taxonomy_version: response.data.taxonomy_version || '',
       };
     } catch (error) {
       console.error('Error fetching taxonomy:', error);

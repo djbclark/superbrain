@@ -108,14 +108,38 @@ async function deltaSync(): Promise<number> {
  * Decides whether to do a full or delta sync.
  * - Empty local DB → full sync
  * - forceFull → full sync (pull-to-refresh after server-side migrations)
+ * - Server taxonomy_version differs from last successful sync → full sync
+ *   (category migrations bump version; delta alone can miss them if the
+ *   device's last_synced_at cursor already advanced)
  * - Has data → delta sync
  * Returns true if any data changed.
  */
 async function syncIfNeeded(forceFull: boolean = false): Promise<boolean> {
   try {
     const empty = await localDb.isEmpty();
-    if (empty || forceFull) {
+    let taxonomyChanged = false;
+    let taxonomyVersion = '';
+    try {
+      const taxonomy = await apiService.getTaxonomy();
+      taxonomyVersion = taxonomy?.taxonomy_version || '';
+      if (taxonomyVersion) {
+        const localVersion = await localDb.getSyncMeta('taxonomy_version');
+        taxonomyChanged = localVersion !== taxonomyVersion;
+        if (taxonomyChanged) {
+          console.log(
+            `[Sync] Taxonomy version changed (${localVersion || 'none'} → ${taxonomyVersion}); forcing full sync`
+          );
+        }
+      }
+    } catch {
+      /* offline / taxonomy endpoint unavailable — fall through */
+    }
+
+    if (empty || forceFull || taxonomyChanged) {
       const count = await fullSync();
+      if (count > 0 && taxonomyVersion) {
+        await localDb.setSyncMeta('taxonomy_version', taxonomyVersion);
+      }
       return count > 0;
     } else {
       const changes = await deltaSync();
