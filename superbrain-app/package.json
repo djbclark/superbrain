@@ -6,7 +6,12 @@
     "start": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "biome:lint": "biome lint src",
+    "biome:lint:write": "biome lint --write src",
+    "biome:ci": "biome lint --diagnostic-level=error src",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run biome:ci && npm run typecheck"
   },
   "dependencies": {
     "@expo/metro-runtime": "~6.1.2",
@@ -36,7 +41,7 @@
     "react-native-web": "^0.21.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "^1.9.0",
+    "@biomejs/biome": "1.9.4",
     "@types/react": "~19.1.0",
     "typescript": "~5.9.2"
   },

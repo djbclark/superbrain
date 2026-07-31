@@ -1,0 +1,40 @@
+name: Check SuperBrain app
+
+on:
+  pull_request:
+    paths:
+      - 'superbrain-app/**'
+      - '.github/workflows/check-app.yml'
+  push:
+    branches: [main, beta]
+    paths:
+      - 'superbrain-app/**'
+      - '.github/workflows/check-app.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Biome and TypeScript
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: superbrain-app
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: superbrain-app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint and type-check
+        run: npm run check
