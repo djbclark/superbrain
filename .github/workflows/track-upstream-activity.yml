@@ -1,0 +1,108 @@
+# Tracks SuperBrain upstream PR activity and next contribution actions.
+# Runs on GitHub Actions infrastructure; no local Mac or Hermes process is required.
+# Setup: TELEGRAM_BOT_TOKEN must be configured as a repository Actions secret.
+
+name: Track upstream activity
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      notify_even_if_unchanged:
+        description: Send a Telegram status report even if nothing changed
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: track-superbrain-upstream-activity
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  STATE_FILE: .cache/upstream-tracker/state.json
+  MESSAGE_FILE: .cache/upstream-tracker/message.html
+
+jobs:
+  check:
+    name: Check upstream PRs and next actions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore previous state
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/upstream-tracker/state.json
+          key: superbrain-upstream-tracker-v1-${{ github.run_id }}
+          restore-keys: |
+            superbrain-upstream-tracker-v1-
+
+      - name: Check upstream activity
+        id: tracker
+        env:
+          FORCE_REPORT: ${{ github.event_name == 'workflow_dispatch' && inputs.notify_even_if_unchanged }}
+          IS_SCHEDULED: ${{ github.event_name == 'schedule' }}
+        run: |
+          args=(
+            --state-file "$STATE_FILE"
+            --message-file "$MESSAGE_FILE"
+          )
+          if [ "$FORCE_REPORT" = "true" ]; then
+            args+=(--force)
+          fi
+          if [ "$IS_SCHEDULED" = "true" ]; then
+            args+=(--scheduled)
+          fi
+          python3 .github/scripts/track_upstream_activity.py "${args[@]}"
+
+      - name: Notify via Telegram
+        id: telegram
+        if: steps.tracker.outputs.notify == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: '838808636'
+          THREAD_ID: '22158'
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "TELEGRAM_BOT_TOKEN is not configured" >&2
+            exit 1
+          fi
+          response=$(curl --fail-with-body --silent --show-error \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --rawfile text "$MESSAGE_FILE" \
+              '{chat_id: $ENV.CHAT_ID | tonumber, message_thread_id: $ENV.THREAD_ID | tonumber, text: $text, parse_mode: "HTML", disable_web_page_preview: true}')")
+          echo "$response" | python3 -c \
+            'import json,sys; data=json.load(sys.stdin); assert data.get("ok"), data'
+
+      # Save only after any required notification succeeds. If Telegram is down,
+      # the previous state remains current and the same change is retried next run.
+      - name: Save current state
+        if: >-
+          steps.tracker.outcome == 'success' &&
+          (steps.tracker.outputs.notify != 'true' || steps.telegram.outcome == 'success')
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/upstream-tracker/state.json
+          key: superbrain-upstream-tracker-v1-${{ github.run_id }}
+
+      - name: Notify if the tracker failed
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: '838808636'
+          THREAD_ID: '22158'
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$TELEGRAM_BOT_TOKEN" ] || exit 0
+          message="🚨 <b>SuperBrain upstream tracker failed</b>\n\n<a href=\"$RUN_URL\">Open the GitHub Actions run</a>"
+          curl --fail-with-body --silent --show-error \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg text "$message" \
+              '{chat_id: $ENV.CHAT_ID | tonumber, message_thread_id: $ENV.THREAD_ID | tonumber, text: $text, parse_mode: "HTML", disable_web_page_preview: true}')" \
+            >/dev/null
