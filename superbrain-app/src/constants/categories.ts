@@ -1,13 +1,12 @@
-export const DEFAULT_CATEGORIES = [
-  { id: 'all', name: 'All', icon: 'star', count: 0 },
-  // Operator taxonomy (config-driven on server)
-  { id: 'sysadmin', name: 'Sysadmin', icon: 'terminal', count: 0 },
-  { id: 'science', name: 'Science', icon: 'flask', count: 0 },
-  { id: 'technology', name: 'Technology', icon: 'hardware-chip', count: 0 },
-  { id: 'history', name: 'History', icon: 'hourglass', count: 0 },
-  { id: 'humanities', name: 'Humanities', icon: 'library', count: 0 },
-  { id: 'politics', name: 'Politics', icon: 'newspaper', count: 0 },
-  // Legacy built-in names (kept until migrated / for older posts)
+/** Chip shown for the unfiltered feed. */
+export const ALL_CATEGORY = { id: 'all', name: 'All', icon: 'star', count: 0 };
+
+/**
+ * Built-in legacy taxonomy (product/places/food/…).
+ * Only used when the server reports `use_default_categories: true`.
+ * When that flag is false, clients must not seed or show these chips.
+ */
+export const BUILTIN_DEFAULT_CATEGORIES = [
   { id: 'product', name: 'Product', icon: 'cube', count: 0 },
   { id: 'places', name: 'Places', icon: 'location', count: 0 },
   { id: 'food', name: 'Food', icon: 'restaurant', count: 0 },
@@ -19,6 +18,12 @@ export const DEFAULT_CATEGORIES = [
   { id: 'event', name: 'Event', icon: 'calendar', count: 0 },
   { id: 'other', name: 'Other', icon: 'pricetag', count: 0 },
 ];
+
+/**
+ * Offline / pre-taxonomy placeholder: All only.
+ * Real chips come from `/taxonomy` after load.
+ */
+export const DEFAULT_CATEGORIES = [ALL_CATEGORY];
 
 export const CATEGORY_ICONS: Record<string, string> = {
   'all': 'star',

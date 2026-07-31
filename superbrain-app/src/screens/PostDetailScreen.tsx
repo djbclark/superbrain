@@ -13,15 +13,18 @@ import { collectionsService } from '../services/collections';
 import { Collection } from '../types';
 import { schedulePostWatchLaterNotification, sendImmediateWatchLaterNotification, sendImmediateSavedNotification } from '../services/notificationService';
 import { getCollectionIconName, getCollectionIconColor } from '../constants/icons';
-import { DEFAULT_CATEGORIES, CATEGORY_ICONS } from '../constants/categories';
+import { BUILTIN_DEFAULT_CATEGORIES, CATEGORY_ICONS } from '../constants/categories';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'PostDetail'>;
 
 type CategoryOption = { id: string; name: string; icon: string };
 
-const FALLBACK_CATEGORIES: CategoryOption[] = DEFAULT_CATEGORIES
-  .filter(c => c.id !== 'all')
-  .map(c => ({ id: c.id, name: c.name, icon: c.icon }));
+/** Only used if /taxonomy is unreachable and defaults are enabled. */
+const FALLBACK_CATEGORIES: CategoryOption[] = BUILTIN_DEFAULT_CATEGORIES.map(c => ({
+  id: c.id,
+  name: c.name,
+  icon: c.icon,
+}));
 
 const PostDetailScreen = ({ route, navigation }: Props) => {
   const { post } = route.params;
@@ -31,7 +34,7 @@ const PostDetailScreen = ({ route, navigation }: Props) => {
   const [editedTitle, setEditedTitle] = useState(post.title);
   const [editedSummary, setEditedSummary] = useState(post.summary);
   const [saving, setSaving] = useState(false);
-  const [categoryOptions, setCategoryOptions] = useState<CategoryOption[]>(FALLBACK_CATEGORIES);
+  const [categoryOptions, setCategoryOptions] = useState<CategoryOption[]>([]);
   const [deleting, setDeleting] = useState(false);
   const [reanalyzing, setReanalyzing] = useState(false);
   const [toast, setToast] = useState({ visible: false, message: '', type: 'info' as 'success' | 'error' | 'warning' | 'info' });
@@ -64,6 +67,12 @@ const PostDetailScreen = ({ route, navigation }: Props) => {
               icon: CATEGORY_ICONS[c.id] || CATEGORY_ICONS[c.name.trim().toLowerCase()] || 'pricetag',
             }))
           );
+          return;
+        }
+        // No taxonomy payload: only fall back to built-ins when the server
+        // still uses the legacy default set (or taxonomy is unavailable).
+        if (taxonomy && taxonomy.use_default_categories === false) {
+          setCategoryOptions([]);
           return;
         }
         const cats = await apiService.getCategories();

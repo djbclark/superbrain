@@ -40,7 +40,7 @@ import { RootStackParamList } from '../../App';
 import CustomToast from '../components/CustomToast';
 import BottomNav from '../components/BottomNav';
 import { getCollectionIconName, getCollectionIconColor } from '../constants/icons';
-import { DEFAULT_CATEGORIES, CATEGORY_ICONS } from '../constants/categories';
+import { ALL_CATEGORY, BUILTIN_DEFAULT_CATEGORIES, DEFAULT_CATEGORIES, CATEGORY_ICONS } from '../constants/categories';
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
@@ -208,21 +208,33 @@ const HomeScreen = () => {
         apiService.getTaxonomy().catch(() => null),
       ]);
 
-      // Prefer configured taxonomy order when available; fall back to app defaults.
-      const seed =
-        taxonomy && taxonomy.categories.length > 0
-          ? taxonomy.categories.map(c => ({
-              id: c.id,
-              name: c.name,
-              icon: CATEGORY_ICONS[c.id] || CATEGORY_ICONS[c.name.trim().toLowerCase()] || 'pricetag-outline',
-              count: 0,
-            }))
-          : DEFAULT_CATEGORIES.filter(c => c.id !== 'all').map(c => ({ ...c, count: 0 }));
+      // use_default_categories=false → only configured [[categories]]; never
+      // seed or surface built-in product/places/food/… chips (even if /categories
+      // still reports historical counts for leftover labels).
+      const useDefaults = taxonomy ? !!taxonomy.use_default_categories : false;
+
+      let seed: Array<{ id: string; name: string; icon: string; count: number }>;
+      if (taxonomy && taxonomy.categories.length > 0) {
+        seed = taxonomy.categories.map(c => ({
+          id: c.id,
+          name: c.name,
+          icon: CATEGORY_ICONS[c.id] || CATEGORY_ICONS[c.name.trim().toLowerCase()] || 'pricetag-outline',
+          count: 0,
+        }));
+      } else if (useDefaults) {
+        seed = BUILTIN_DEFAULT_CATEGORIES.map(c => ({ ...c, count: 0 }));
+      } else {
+        seed = [];
+      }
 
       const mergedById = new Map(seed.map(c => [c.id.toLowerCase(), { ...c }]));
+      const configuredIds = new Set(mergedById.keys());
 
       for (const c of cats || []) {
         const id = c.id.toLowerCase();
+        if (!useDefaults && configuredIds.size > 0 && !configuredIds.has(id)) {
+          continue; // strict custom taxonomy: drop legacy / uncatalogued chips
+        }
         const existing = mergedById.get(id);
         mergedById.set(id, {
           id,
@@ -232,15 +244,9 @@ const HomeScreen = () => {
         });
       }
 
-      // Hide legacy zero-count defaults when a configured taxonomy is active.
-      let merged = Array.from(mergedById.values());
-      if (taxonomy && taxonomy.categories.length > 0) {
-        const configured = new Set(taxonomy.categories.map(c => c.id.toLowerCase()));
-        merged = merged.filter(c => configured.has(c.id.toLowerCase()) || c.count > 0);
-      }
-
-      const totalCount = merged.reduce((sum, c) => sum + c.count, 0);
-      setCategories([{ id: 'all', name: 'All', icon: 'star', count: totalCount }, ...merged]);
+      const merged = Array.from(mergedById.values());
+      const totalCount = (cats || []).reduce((sum, c) => sum + (c.count || 0), 0);
+      setCategories([{ ...ALL_CATEGORY, count: totalCount }, ...merged]);
     } catch (e) {
       console.warn('Failed to load categories, using defaults:', e);
     }
