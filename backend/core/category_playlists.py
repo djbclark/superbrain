@@ -757,6 +757,32 @@ def sync_video_category(
         db.delete_category_youtube_playlist_pending(shortcode)
         return result
 
+    # Multi-membership: already on the target playlist (common in add_only).
+    if resolved:
+        target_pl = db.get_category_youtube_playlist(resolved)
+        if target_pl and target_pl.get("playlist_id"):
+            memb = db.get_category_youtube_playlist_membership(
+                video_id, target_pl["playlist_id"]
+            )
+            if memb:
+                db.upsert_category_youtube_playlist_item(
+                    video_id=video_id,
+                    shortcode=shortcode,
+                    category_name=resolved,
+                    playlist_id=target_pl["playlist_id"],
+                    playlist_item_id=memb.get("playlist_item_id"),
+                )
+                result["skipped"] = "already_synced"
+                result["actions"].append(
+                    {
+                        "op": "membership_present",
+                        "category": resolved,
+                        "playlist_id": target_pl["playlist_id"],
+                    }
+                )
+                db.delete_category_youtube_playlist_pending(shortcode)
+                return result
+
     needs_remove = bool(
         existing
         and existing.get("playlist_item_id")
@@ -995,6 +1021,9 @@ def sync_video_category(
                     return result
                 raise
             result["actions"].append(pending_remove)
+            db.delete_category_youtube_playlist_item(
+                video_id, playlist_id=pending_remove.get("playlist_id")
+            )
 
     db.delete_category_youtube_playlist_pending(shortcode)
     return result

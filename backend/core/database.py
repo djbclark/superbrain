@@ -289,7 +289,32 @@ class Database:
                 ON category_youtube_playlist_items (category_name);
             CREATE INDEX IF NOT EXISTS idx_cat_yt_items_shortcode
                 ON category_youtube_playlist_items (shortcode);
+            -- All known playlist memberships (supports add_only multi-playlist).
+            CREATE TABLE IF NOT EXISTS category_youtube_playlist_memberships (
+                video_id          TEXT NOT NULL,
+                playlist_id       TEXT NOT NULL,
+                shortcode         TEXT,
+                category_name     TEXT NOT NULL,
+                playlist_item_id  TEXT,
+                updated_at        TEXT,
+                PRIMARY KEY (video_id, playlist_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cat_yt_memb_shortcode
+                ON category_youtube_playlist_memberships (shortcode);
+            CREATE INDEX IF NOT EXISTS idx_cat_yt_memb_category
+                ON category_youtube_playlist_memberships (category_name);
         """)
+        self._conn.commit()
+        # Backfill memberships from legacy single-row items once.
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO category_youtube_playlist_memberships
+                (video_id, playlist_id, shortcode, category_name, playlist_item_id, updated_at)
+            SELECT video_id, playlist_id, shortcode, category_name, playlist_item_id, updated_at
+            FROM category_youtube_playlist_items
+            WHERE playlist_id IS NOT NULL AND playlist_id != ''
+            """
+        )
         self._conn.commit()
 
         # Local YouTube Data API quota ledger (Pacific calendar day) + deferred sync
@@ -1454,15 +1479,97 @@ class Database:
             """,
             (video_id, shortcode, category_name, playlist_id, playlist_item_id, now),
         )
+        if playlist_id:
+            self._conn.execute(
+                """
+                INSERT INTO category_youtube_playlist_memberships
+                    (video_id, playlist_id, shortcode, category_name, playlist_item_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(video_id, playlist_id) DO UPDATE SET
+                    shortcode = excluded.shortcode,
+                    category_name = excluded.category_name,
+                    playlist_item_id = COALESCE(excluded.playlist_item_id, category_youtube_playlist_memberships.playlist_item_id),
+                    updated_at = excluded.updated_at
+                """,
+                (video_id, playlist_id, shortcode, category_name, playlist_item_id, now),
+            )
         self._conn.commit()
 
-    def delete_category_youtube_playlist_item(self, video_id):
+    def delete_category_youtube_playlist_item(self, video_id, playlist_id=None):
+        if playlist_id:
+            self._conn.execute(
+                """
+                DELETE FROM category_youtube_playlist_memberships
+                WHERE video_id = ? AND playlist_id = ?
+                """,
+                (video_id, playlist_id),
+            )
+            # Keep primary item row if it still points at another playlist.
+            row = self.get_category_youtube_playlist_item(video_id)
+            if row and row.get("playlist_id") == playlist_id:
+                # Promote another membership if present, else delete primary.
+                other = self._conn.execute(
+                    """
+                    SELECT * FROM category_youtube_playlist_memberships
+                    WHERE video_id = ? ORDER BY updated_at DESC LIMIT 1
+                    """,
+                    (video_id,),
+                ).fetchone()
+                if other:
+                    self._conn.execute(
+                        """
+                        UPDATE category_youtube_playlist_items SET
+                            shortcode = ?, category_name = ?, playlist_id = ?,
+                            playlist_item_id = ?, updated_at = ?
+                        WHERE video_id = ?
+                        """,
+                        (
+                            other["shortcode"],
+                            other["category_name"],
+                            other["playlist_id"],
+                            other["playlist_item_id"],
+                            _utcnow().isoformat(),
+                            video_id,
+                        ),
+                    )
+                else:
+                    self._conn.execute(
+                        "DELETE FROM category_youtube_playlist_items WHERE video_id = ?",
+                        (video_id,),
+                    )
+            self._conn.commit()
+            return True
+        self._conn.execute(
+            "DELETE FROM category_youtube_playlist_memberships WHERE video_id = ?",
+            (video_id,),
+        )
         cur = self._conn.execute(
             "DELETE FROM category_youtube_playlist_items WHERE video_id = ?",
             (video_id,),
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def list_category_youtube_playlist_memberships(self, video_id):
+        rows = self._conn.execute(
+            """
+            SELECT * FROM category_youtube_playlist_memberships
+            WHERE video_id = ?
+            ORDER BY updated_at DESC
+            """,
+            (video_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_category_youtube_playlist_membership(self, video_id, playlist_id):
+        row = self._conn.execute(
+            """
+            SELECT * FROM category_youtube_playlist_memberships
+            WHERE video_id = ? AND playlist_id = ?
+            """,
+            (video_id, playlist_id),
+        ).fetchone()
+        return dict(row) if row else None
 
     # ------------------------------------------------------------------
     # YouTube API quota ledger + pending playlist sync

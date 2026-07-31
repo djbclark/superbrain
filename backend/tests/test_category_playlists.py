@@ -530,6 +530,10 @@ class TestQuotaBudget(unittest.TestCase):
         self.assertTrue(out["ok"])
         client.remove_playlist_item.assert_not_called()
         client.add_video.assert_called_with("PL_other", "addonlyvid1", position=0)
+        memberships = self.db.list_category_youtube_playlist_memberships("addonlyvid1")
+        playlist_ids = {m["playlist_id"] for m in memberships}
+        self.assertIn("PL_sys", playlist_ids)
+        self.assertIn("PL_other", playlist_ids)
 
     def test_reconcile_vs_rebuild_break_even(self):
         from core.category_playlists import plan_reconcile_vs_rebuild
