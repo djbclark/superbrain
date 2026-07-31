@@ -40,7 +40,11 @@ import { RootStackParamList } from '../../App';
 import CustomToast from '../components/CustomToast';
 import BottomNav from '../components/BottomNav';
 import { getCollectionIconName, getCollectionIconColor } from '../constants/icons';
-import { ALL_CATEGORY, BUILTIN_DEFAULT_CATEGORIES, DEFAULT_CATEGORIES, CATEGORY_ICONS } from '../constants/categories';
+import { ALL_CATEGORY, DEFAULT_CATEGORIES, CATEGORY_ICONS } from '../constants/categories';
+import {
+  isTaxonomyApiActive,
+  usesStrictCustomTaxonomy,
+} from '../services/taxonomySupport';
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
@@ -208,23 +212,22 @@ const HomeScreen = () => {
         apiService.getTaxonomy().catch(() => null),
       ]);
 
-      // use_default_categories=false → only configured [[categories]]; never
-      // seed or surface built-in product/places/food/… chips (even if /categories
-      // still reports historical counts for leftover labels).
-      const useDefaults = taxonomy ? !!taxonomy.use_default_categories : false;
+      // No GET /taxonomy (upstream today) → keep full built-in pill set + counts.
+      // Taxonomy present + use_default_categories=false → configured chips only.
+      // Taxonomy present + defaults on → seed from server taxonomy list.
+      const taxonomyActive = isTaxonomyApiActive(taxonomy);
+      const strictCustom = usesStrictCustomTaxonomy(taxonomy);
 
       let seed: Array<{ id: string; name: string; icon: string; count: number }>;
-      if (taxonomy && taxonomy.categories.length > 0) {
-        seed = taxonomy.categories.map(c => ({
+      if (taxonomyActive) {
+        seed = taxonomy!.categories.map(c => ({
           id: c.id,
           name: c.name,
           icon: CATEGORY_ICONS[c.id] || CATEGORY_ICONS[c.name.trim().toLowerCase()] || 'pricetag-outline',
           count: 0,
         }));
-      } else if (useDefaults) {
-        seed = BUILTIN_DEFAULT_CATEGORIES.map(c => ({ ...c, count: 0 }));
       } else {
-        seed = [];
+        seed = DEFAULT_CATEGORIES.filter(c => c.id !== 'all').map(c => ({ ...c, count: 0 }));
       }
 
       const mergedById = new Map(seed.map(c => [c.id.toLowerCase(), { ...c }]));
@@ -232,8 +235,8 @@ const HomeScreen = () => {
 
       for (const c of cats || []) {
         const id = c.id.toLowerCase();
-        if (!useDefaults && configuredIds.size > 0 && !configuredIds.has(id)) {
-          continue; // strict custom taxonomy: drop legacy / uncatalogued chips
+        if (strictCustom && !configuredIds.has(id)) {
+          continue;
         }
         const existing = mergedById.get(id);
         mergedById.set(id, {
@@ -245,7 +248,10 @@ const HomeScreen = () => {
       }
 
       const merged = Array.from(mergedById.values());
-      const totalCount = (cats || []).reduce((sum, c) => sum + (c.count || 0), 0);
+      // Upstream totals from visible chips; strict taxonomy still counts all posts in All.
+      const totalCount = strictCustom
+        ? (cats || []).reduce((sum, c) => sum + (c.count || 0), 0)
+        : merged.reduce((sum, c) => sum + c.count, 0);
       setCategories([{ ...ALL_CATEGORY, count: totalCount }, ...merged]);
     } catch (e) {
       console.warn('Failed to load categories, using defaults:', e);
@@ -315,8 +321,15 @@ const HomeScreen = () => {
         const merged = [...analyzingPlaceholders, ...localPosts];
         setPosts(merged);
         setLoading(false);
-        // Do not return early: always continue to background sync so server-side
-        // recategorizations / taxonomy cuts reach the device.
+
+        // Upstream path: return early when local data is enough.
+        // Taxonomy-aware servers: always continue so migrations reach the device.
+        if (!forceRefresh && analyzingShortcodes.length === 0) {
+          const taxonomy = await apiService.getTaxonomy().catch(() => null);
+          if (!isTaxonomyApiActive(taxonomy)) {
+            return;
+          }
+        }
       } else {
         // No local data at all — show loading spinner
         setLoading(true);
@@ -331,12 +344,17 @@ const HomeScreen = () => {
         await postsCache.flushPendingPostMutations();
         await postsCache.flushPendingAnalyses();
 
-        // Delta or full sync depending on DB state / pull-to-refresh
+        // forceFull / taxonomy_version resync only activate when GET /taxonomy exists
+        // (see syncService); without it this matches upstream delta-only sync.
         const dataChanged = await syncService.syncIfNeeded(forceRefresh);
 
         // If sync brought new data, re-read from local DB and update UI
         if (dataChanged || forceRefresh) {
-          await loadCategories();
+          // Category chip reload is taxonomy-aware; skip extra work on mainline.
+          const taxonomy = await apiService.getTaxonomy().catch(() => null);
+          if (isTaxonomyApiActive(taxonomy)) {
+            await loadCategories();
+          }
           const freshPosts = await localDb.getAllPosts();
           if (freshPosts.length > 0) {
             // Clear analyzing state for posts that now exist in the synced data
@@ -425,7 +443,6 @@ const HomeScreen = () => {
 
   const onRefresh = async () => {
     setRefreshing(true);
-    await loadCategories();
     await loadPosts(true); // Force refresh from server
     setRefreshing(false);
   };

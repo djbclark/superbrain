@@ -443,8 +443,11 @@ class ApiService {
         use_default_categories: !!response.data.use_default_categories,
         taxonomy_version: response.data.taxonomy_version || '',
       };
-    } catch (error) {
-      console.error('Error fetching taxonomy:', error);
+    } catch (error: any) {
+      // 404 = upstream / pre-taxonomy servers — silent by design
+      if (error?.response?.status !== 404) {
+        console.error('Error fetching taxonomy:', error);
+      }
       return null;
     }
   }

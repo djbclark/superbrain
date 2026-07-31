@@ -107,10 +107,10 @@ async function deltaSync(): Promise<number> {
 /**
  * Decides whether to do a full or delta sync.
  * - Empty local DB → full sync
- * - forceFull → full sync (pull-to-refresh after server-side migrations)
- * - Server taxonomy_version differs from last successful sync → full sync
- *   (category migrations bump version; delta alone can miss them if the
- *   device's last_synced_at cursor already advanced)
+ * - forceFull → full sync only when GET /taxonomy is active (taxonomy-aware
+ *   servers / pull-to-refresh after migrations). Without taxonomy, forceFull
+ *   is ignored so behavior matches upstream mainline (delta only).
+ * - taxonomy_version change → full sync (no-op when endpoint absent)
  * - Has data → delta sync
  * Returns true if any data changed.
  */
@@ -119,9 +119,11 @@ async function syncIfNeeded(forceFull: boolean = false): Promise<boolean> {
     const empty = await localDb.isEmpty();
     let taxonomyChanged = false;
     let taxonomyVersion = '';
+    let taxonomyActive = false;
     try {
       const taxonomy = await apiService.getTaxonomy();
-      taxonomyVersion = taxonomy?.taxonomy_version || '';
+      taxonomyActive = !!(taxonomy && taxonomy.categories.length > 0);
+      taxonomyVersion = taxonomyActive ? (taxonomy?.taxonomy_version || '') : '';
       if (taxonomyVersion) {
         const localVersion = await localDb.getSyncMeta('taxonomy_version');
         taxonomyChanged = localVersion !== taxonomyVersion;
@@ -132,10 +134,12 @@ async function syncIfNeeded(forceFull: boolean = false): Promise<boolean> {
         }
       }
     } catch {
-      /* offline / taxonomy endpoint unavailable — fall through */
+      /* offline / taxonomy endpoint unavailable — upstream path */
     }
 
-    if (empty || forceFull || taxonomyChanged) {
+    const effectiveForceFull = forceFull && taxonomyActive;
+
+    if (empty || effectiveForceFull || taxonomyChanged) {
       const count = await fullSync();
       if (count > 0 && taxonomyVersion) {
         await localDb.setSyncMeta('taxonomy_version', taxonomyVersion);

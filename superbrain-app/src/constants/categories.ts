@@ -2,9 +2,9 @@
 export const ALL_CATEGORY = { id: 'all', name: 'All', icon: 'star', count: 0 };
 
 /**
- * Built-in legacy taxonomy (product/places/food/…).
- * Only used when the server reports `use_default_categories: true`.
- * When that flag is false, clients must not seed or show these chips.
+ * Built-in mainline categories (product/places/food/…).
+ * Used when GET /taxonomy is unavailable, or when the server sets
+ * use_default_categories=true. Matching upstream default chip set.
  */
 export const BUILTIN_DEFAULT_CATEGORIES = [
   { id: 'product', name: 'Product', icon: 'cube', count: 0 },
@@ -20,10 +20,10 @@ export const BUILTIN_DEFAULT_CATEGORIES = [
 ];
 
 /**
- * Offline / pre-taxonomy placeholder: All only.
- * Real chips come from `/taxonomy` after load.
+ * Default chip set for servers without config-driven taxonomy (upstream path).
+ * Custom taxonomies replace this via GET /taxonomy when present.
  */
-export const DEFAULT_CATEGORIES = [ALL_CATEGORY];
+export const DEFAULT_CATEGORIES = [ALL_CATEGORY, ...BUILTIN_DEFAULT_CATEGORIES];
 
 export const CATEGORY_ICONS: Record<string, string> = {
   'all': 'star',

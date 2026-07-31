@@ -14,12 +14,13 @@ import { Collection } from '../types';
 import { schedulePostWatchLaterNotification, sendImmediateWatchLaterNotification, sendImmediateSavedNotification } from '../services/notificationService';
 import { getCollectionIconName, getCollectionIconColor } from '../constants/icons';
 import { BUILTIN_DEFAULT_CATEGORIES, CATEGORY_ICONS } from '../constants/categories';
+import { isTaxonomyApiActive } from '../services/taxonomySupport';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'PostDetail'>;
 
 type CategoryOption = { id: string; name: string; icon: string };
 
-/** Only used if /taxonomy is unreachable and defaults are enabled. */
+/** Upstream / no-taxonomy edit list (built-in mainline categories). */
 const FALLBACK_CATEGORIES: CategoryOption[] = BUILTIN_DEFAULT_CATEGORIES.map(c => ({
   id: c.id,
   name: c.name,
@@ -34,7 +35,7 @@ const PostDetailScreen = ({ route, navigation }: Props) => {
   const [editedTitle, setEditedTitle] = useState(post.title);
   const [editedSummary, setEditedSummary] = useState(post.summary);
   const [saving, setSaving] = useState(false);
-  const [categoryOptions, setCategoryOptions] = useState<CategoryOption[]>([]);
+  const [categoryOptions, setCategoryOptions] = useState<CategoryOption[]>(FALLBACK_CATEGORIES);
   const [deleting, setDeleting] = useState(false);
   const [reanalyzing, setReanalyzing] = useState(false);
   const [toast, setToast] = useState({ visible: false, message: '', type: 'info' as 'success' | 'error' | 'warning' | 'info' });
@@ -59,27 +60,10 @@ const PostDetailScreen = ({ route, navigation }: Props) => {
       try {
         const taxonomy = await apiService.getTaxonomy();
         if (cancelled) return;
-        if (taxonomy && taxonomy.categories.length > 0) {
+        // Only replace the built-in picker when the server exposes taxonomy.
+        if (isTaxonomyApiActive(taxonomy)) {
           setCategoryOptions(
-            taxonomy.categories.map(c => ({
-              id: c.id,
-              name: c.name,
-              icon: CATEGORY_ICONS[c.id] || CATEGORY_ICONS[c.name.trim().toLowerCase()] || 'pricetag',
-            }))
-          );
-          return;
-        }
-        // No taxonomy payload: only fall back to built-ins when the server
-        // still uses the legacy default set (or taxonomy is unavailable).
-        if (taxonomy && taxonomy.use_default_categories === false) {
-          setCategoryOptions([]);
-          return;
-        }
-        const cats = await apiService.getCategories();
-        if (cancelled) return;
-        if (cats && cats.length > 0) {
-          setCategoryOptions(
-            cats.map(c => ({
+            taxonomy!.categories.map(c => ({
               id: c.id,
               name: c.name,
               icon: CATEGORY_ICONS[c.id] || CATEGORY_ICONS[c.name.trim().toLowerCase()] || 'pricetag',
@@ -87,7 +71,7 @@ const PostDetailScreen = ({ route, navigation }: Props) => {
           );
         }
       } catch {
-        // Keep FALLBACK_CATEGORIES
+        // Keep FALLBACK_CATEGORIES (upstream path)
       }
     })();
     return () => {
