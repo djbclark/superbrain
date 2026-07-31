@@ -1,9 +1,48 @@
 # SuperBrain session handoff
 
-Status captured **2026-07-31**. There are no known blockers or immediate
-upstream replies required.
+Status captured **2026-07-31 afternoon ET**. Live playlist backfill is sleeping
+until Pacific midnight (~03:00 ET / 00:00 PT on 2026-08-01).
 
 ## Current next action
+
+1. **Babysit playlist backfill through PT midnight reset** (~03:00 ET 2026-08-01).
+   Confirm `day_key` rolls to `2026-08-01`, usage events record, historic sync
+   uses ~10% daytime cap then near-reset spend, inserts at `position=0`.
+2. Wait for upstream review of PRs #4/#5 and feedback on proposal #6 (unchanged).
+
+Babysit commands:
+
+```bash
+pgrep -lf 'sync-category-playlists'
+tail -n 40 ~/Library/Logs/superbrain/category-playlist-backfill.log
+superbrain --category-playlists-status
+superbrain --youtube-quota-stats
+```
+
+Restart backfill only if dead (deploy refuses while sync is running):
+
+```bash
+pkill -f 'main.py --sync-category-playlists' || true
+bash ~/src/superbrain/backend/scripts/deploy-local.sh
+nohup superbrain --sync-category-playlists >> ~/Library/Logs/superbrain/category-playlist-backfill.log 2>&1 &
+```
+
+## Fork playlist / quota work (shipped on main)
+
+Recent work on `djbclark/superbrain` `main`:
+
+- Quota-aware newest-first sync (new-video reserve, near-reset historic, pending queue, position-0)
+- Durable YouTube API usage events + cost table + CLI/API stats ([issue #5](https://github.com/djbclark/superbrain/issues/5))
+- `membership_mode=move|add_only`, reconcile-vs-rebuild planner with savings margin
+- Strict moves add-before-delete; live sync debounce; no synthetic duplicate item IDs
+
+Runtime: `~/.superbrain-server`. Log:
+`~/Library/Logs/superbrain/category-playlist-backfill.log`.
+
+Still open on #5: multi-membership rows for add-only cleanup, hosted per-user
+budgets, automatic rebuild execution (intentionally not done — recommendation only).
+
+## Upstream contribution sequence
 
 Wait for upstream review of these ready, clean pull requests:
 
@@ -13,95 +52,48 @@ Wait for upstream review of these ready, clean pull requests:
 Also wait for maintainer feedback on
 [sidinsearch/superbrain#6 — opt-in YouTube subscription organization and private category playlists](https://github.com/sidinsearch/superbrain/issues/6).
 
-At the time of this handoff, both PRs were open, mergeable, and had no issue or
-review comments. Proposal #6 had three comments, all from `djbclark`; there was
-no maintainer response to answer.
-
 The [hourly upstream activity workflow](https://github.com/djbclark/superbrain/actions/workflows/track-upstream-activity.yml)
-runs entirely on GitHub Actions. It sends Telegram notifications for upstream
-PR and proposal comments, reviews, requested changes, state changes, changed
-next actions, three-day PR reminders, and seven-day proposal reminders. Its
-expanded proposal-aware version passed
-[run 30638150707](https://github.com/djbclark/superbrain/actions/runs/30638150707).
-
-## Contribution sequence
+runs entirely on GitHub Actions (Telegram notifications for upstream activity).
 
 1. Respond narrowly if the tracker reports an upstream comment, review, or
    requested change on PR #4, PR #5, or proposal #6.
 2. When either current PR closes and a slot opens, rebase and submit the queued
-   `prep/biome-tooling` branch. It is pushed at `b5301e8`, is one commit based
-   on upstream `main`, and passed `npm ci` plus `npm run check` across 28 source
-   files. The tracker will automatically detect the resulting upstream PR.
-3. Continue the contribution plan in
-   [fork issue #3](https://github.com/djbclark/superbrain/issues/3) for
-   YouTube-related improvements that are independent of enhanced YouTube Data
-   API access. Keep at most two independent upstream PRs open. Hold work that
-   depends on enhanced access, increased quota, or related Google/YouTube
-   approval out of those PRs.
-4. After the delta-sync PR, prepare the generic SQLite
-   concurrency/worker-safety wave described in issue #3. Before configurable
-   taxonomy work, open an upstream design issue and obtain maintainer direction.
+   `prep/biome-tooling` branch (`b5301e8`).
+3. Continue [fork issue #3](https://github.com/djbclark/superbrain/issues/3) for
+   YouTube-related improvements independent of enhanced API access. Hold
+   approval-dependent work out of upstream PRs.
+4. After the delta-sync PR, prepare the generic SQLite concurrency/worker-safety
+   wave in issue #3.
 
-The YouTube API end-state proposal is mirrored in
-[fork issue #4](https://github.com/djbclark/superbrain/issues/4). Quota
-instrumentation and API-use optimization—including add-only versus strict
-moves and individual reconciliation versus explicit playlist rebuild—are
-tracked in [fork issue #5](https://github.com/djbclark/superbrain/issues/5).
+Mirrored proposal: [fork issue #4](https://github.com/djbclark/superbrain/issues/4).
+Quota instrumentation: [fork issue #5](https://github.com/djbclark/superbrain/issues/5).
 
-Current pushed branch tips:
-
-- `dpr/test-live-api-isolation` — `937704c`
-- `dpr/mobile-delta-sync-pagination` — `44df0a0`
-- `prep/biome-tooling` — `b5301e8`
+Branch tips: `dpr/test-live-api-isolation` `937704c`,
+`dpr/mobile-delta-sync-pagination` `44df0a0`, `prep/biome-tooling` `b5301e8`.
 
 ## YouTube quota request
 
-The YouTube Data API audit/quota-extension form was submitted successfully on
-2026-07-31, requesting 500,000 daily quota units for the development project.
-There is no action until Google replies by email. Email is not part of the
-GitHub/Telegram upstream monitor.
+Form submitted 2026-07-31 requesting 500,000 daily units. Wait for Google email.
+Public record: [`YOUTUBE_API_QUOTA_HANDOFF.md`](YOUTUBE_API_QUOTA_HANDOFF.md).
+Private companion in site-private memory (authorized agents only).
 
-The reusable non-sensitive form record and all safe evidence are public in
-[`YOUTUBE_API_QUOTA_HANDOFF.md`](YOUTUBE_API_QUOTA_HANDOFF.md). Personal
-contact/address fields and the Google Cloud project identifier are isolated in
-the
-[private companion record](https://github.com/djbclark/site-private/blob/backup-superbrain-youtube-form/memory/reference_superbrain_youtube_api_quota_form.md),
-which is available only to authorized agents.
-
-Current quota analysis: listing subscriptions is cheap; playlist writes drive
-usage. Default quota supports roughly 175–190 new playlist items per day after
-normal overhead, while a strict category move costs approximately twice an
-insertion. Ordinary self-hosted use can pace work under default quota; the
-large historical backfill is what makes enhanced quota useful. Issue #5 will
-add durable statistics rather than relying on estimates.
-
-Before any resubmission, recalculate the remaining playlist backfill, verify
-the public URLs and current policies, and submit only with explicit operator
-approval.
+With the local budget (10% historic by day / near-reset catch-up), default
+quota supports ~20 historic inserts/day plus reserved new-video capacity;
+~6.7k unsynced remain unless Google raises project quota.
 
 ## Broad multi-user feature work
 
-- [Fork issue #1](https://github.com/djbclark/superbrain/issues/1) tracks the
-  production/distribution decision, Google approvals, OAuth verification,
-  privacy, quota, security, and rollout requirements.
-- [Fork issue #2](https://github.com/djbclark/superbrain/issues/2) is the
-  code-derived hosted multi-user implementation plan and is explicitly blocked
-  by issue #1. It preserves bulk selection and ongoing bulk consent; users must
-  not approve each channel or video separately.
+- [Fork issue #1](https://github.com/djbclark/superbrain/issues/1) — production readiness
+- [Fork issue #2](https://github.com/djbclark/superbrain/issues/2) — multi-user plan (blocked by #1)
 
 Do not assume the development quota request authorizes a shared hosted
-multi-user service. Broad launch requires a production project, revised
-audit/quota request, OAuth verification, tenant isolation, accurate hosted
-privacy terms, and the required approvals.
+multi-user service.
 
 ## Suggested resume prompt
 
-> Continue the SuperBrain handoff. Read `AGENTS.md`, then check upstream PRs #4
-> and #5, upstream proposal #6, and fork roadmap #3. If there is maintainer
-> feedback, address it narrowly. If a PR slot has opened, rebase and submit
-> `prep/biome-tooling`. Keep work that depends on enhanced YouTube Data API
-> access, increased quota, or related approval out of upstream PRs until
-> upstream has accepted the proposal and the required Google/YouTube approval
-> is ready. Use fork issue #5 for quota instrumentation and optimization. Also
-> report whether Google has replied to the 2026-07-31 quota request if email
-> access is available.
+> Continue the SuperBrain handoff. Read `AGENTS.md` and `docs/SESSION_HANDOFF.md`.
+> Babysit `superbrain --sync-category-playlists` through Pacific midnight
+> (~03:00 ET 2026-08-01): confirm day_key roll, usage events, position-0
+> inserts, and historic 10%/near-reset pacing. Check upstream PRs #4/#5 and
+> proposal #6. Remaining fork #5: multi-membership add-only tracking if needed.
+> Report Google quota-email reply if email access is available.

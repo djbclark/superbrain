@@ -169,9 +169,17 @@ class TestPlaylistSync(unittest.TestCase):
         )
         self.assertTrue(moved["ok"])
         ops = [a["op"] for a in moved["actions"]]
-        self.assertIn("remove", ops)
-        self.assertIn("add", ops)
+        self.assertEqual(ops, ["add", "remove"])
         client.remove_playlist_item.assert_called()
+        add_pos = next(
+            i for i, c in enumerate(client.mock_calls) if "add_video" in str(c)
+        )
+        rem_pos = next(
+            i
+            for i, c in enumerate(client.mock_calls)
+            if "remove_playlist_item" in str(c)
+        )
+        self.assertLess(add_pos, rem_pos)
         row = self.db.get_category_youtube_playlist_item("dQw4w9WgXcQ")
         self.assertEqual(row["category_name"], "Other")
 
@@ -403,6 +411,72 @@ class TestQuotaBudget(unittest.TestCase):
         self.assertEqual(priority_for_analysis_row(cfg, fresh, now=now), "new")
         self.assertEqual(priority_for_analysis_row(cfg, old, now=now), "historic")
 
+    def test_debounce_keeps_final_category(self):
+        from core import category_playlists as cp
+
+        clear_taxonomy_cache()
+        cfg_path = Path(self.tmp.name) / "categories.toml"
+        cfg_path.write_text(
+            TOML + "\nsync_debounce_seconds = 0.05\n",
+            encoding="utf-8",
+        )
+        # Force load from this path via env for maybe_sync
+        import os
+
+        os.environ["SUPERBRAIN_CATEGORIES_CONFIG"] = str(cfg_path)
+        self.db.save_analysis(
+            shortcode="YT_debounce0001",
+            url="https://www.youtube.com/watch?v=debounce0001",
+            username="u",
+            title="t",
+            summary="s",
+            tags=[],
+            music="",
+            category="Sysadmin",
+            content_type="youtube",
+        )
+        self.db.upsert_category_youtube_playlist(
+            "Sysadmin", "PL_sys", "SB — Sysadmin"
+        )
+        self.db.upsert_category_youtube_playlist(
+            "Other", "PL_other", "SB — Other"
+        )
+        calls = []
+
+        def fake_sync(db, **kwargs):
+            calls.append(kwargs.get("new_category"))
+            return {"ok": True, "skipped": None, "actions": [{"op": "add"}]}
+
+        original = cp.sync_video_category
+        cp.sync_video_category = fake_sync
+        try:
+            from core.database import get_db as real_get_db
+            import core.database as dbmod
+
+            dbmod._db_instance = self.db
+            cp.maybe_sync_after_category_change(
+                self.db,
+                shortcode="YT_debounce0001",
+                url="https://www.youtube.com/watch?v=debounce0001",
+                new_category="Sysadmin",
+                content_type="youtube",
+            )
+            cp.maybe_sync_after_category_change(
+                self.db,
+                shortcode="YT_debounce0001",
+                url="https://www.youtube.com/watch?v=debounce0001",
+                new_category="Other",
+                content_type="youtube",
+            )
+            import time as _time
+
+            _time.sleep(0.2)
+            self.assertEqual(calls, ["Other"])
+        finally:
+            cp.sync_video_category = original
+            dbmod._db_instance = None
+            os.environ.pop("SUPERBRAIN_CATEGORIES_CONFIG", None)
+
     def test_add_only_skips_remove(self):
         clear_taxonomy_cache()
         cfg_path = Path(self.tmp.name) / "categories.toml"
@@ -486,7 +560,7 @@ class TestQuotaBudget(unittest.TestCase):
                 playlist_id="PL_sys",
                 playlist_item_id=f"keep_{i}",
             )
-        for i in range(5):
+        for i in range(8):
             vid = f"stale{i:07d}"
             self.db.upsert_category_youtube_playlist_item(
                 video_id=vid,
@@ -495,13 +569,21 @@ class TestQuotaBudget(unittest.TestCase):
                 playlist_id="PL_sys",
                 playlist_item_id=f"stale_{i}",
             )
+        cfg = PlaylistSyncConfig(
+            enabled=True,
+            dry_run=False,
+            title_prefix=cfg.title_prefix,
+            config_path=cfg_path,
+            rebuild_savings_margin_units=100,
+        )
         plan = plan_reconcile_vs_rebuild(self.db, config=cfg)
         sysadmin = plan["categories"]["Sysadmin"]
         self.assertEqual(sysadmin["retained"], 2)
-        self.assertEqual(sysadmin["deletions"], 5)
+        self.assertEqual(sysadmin["deletions"], 8)
         self.assertEqual(sysadmin["additions"], 0)
+        # reconcile=400, rebuild=200, savings=200 >= margin 100
         self.assertTrue(sysadmin["prefer_rebuild"])
-        self.assertGreater(sysadmin["savings_if_rebuild"], 0)
+        self.assertGreaterEqual(sysadmin["savings_if_rebuild"], 100)
 
 
 if __name__ == "__main__":

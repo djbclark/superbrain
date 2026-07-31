@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -56,6 +57,8 @@ class PlaylistSyncConfig:
     idle_sleep_seconds: float = 180.0
     # "move" = remove from previous category playlist; "add_only" = never auto-delete.
     membership_mode: str = "move"
+    sync_debounce_seconds: float = 2.0
+    rebuild_savings_margin_units: int = 100
 
     def includes(self, category_name: str) -> bool:
         if self.categories is None:
@@ -144,6 +147,10 @@ def load_playlist_sync_config(path: Optional[Path] = None) -> PlaylistSyncConfig
             == "add_only"
             else "move"
         ),
+        sync_debounce_seconds=max(0.0, _float("sync_debounce_seconds", 2.0)),
+        rebuild_savings_margin_units=max(
+            0, _int("rebuild_savings_margin_units", 100)
+        ),
     )
 
 
@@ -182,6 +189,8 @@ def enable_playlist_sync_in_config(
         f"fresh_window_hours = {existing.fresh_window_hours}",
         f"idle_sleep_seconds = {existing.idle_sleep_seconds}",
         f'membership_mode = "{existing.membership_mode}"',
+        f"sync_debounce_seconds = {existing.sync_debounce_seconds}",
+        f"rebuild_savings_margin_units = {existing.rebuild_savings_margin_units}",
     ]
     if existing.categories:
         cats = ", ".join(f'"{c}"' for c in existing.categories)
@@ -794,8 +803,8 @@ def sync_video_category(
         if hasattr(yt, "_db") and getattr(yt, "_db", None) is None:
             yt._db = db
 
-    # Remove from previous category playlist when category changes.
-    if needs_remove:
+    # Removal without a new target (hidden / outside sync set): delete only.
+    if needs_remove and not resolved:
         prev_cat = existing.get("category_name")
         action = {
             "op": "remove",
@@ -807,32 +816,32 @@ def sync_video_category(
         if cfg.dry_run:
             action["op"] = "would_remove"
             result["actions"].append(action)
-        else:
-            assert yt is not None
-            try:
-                yt.remove_playlist_item(existing["playlist_item_id"])
-            except Exception as exc:
-                if is_youtube_quota_error(exc):
-                    mark_day_exhausted(db)
-                    enqueue_pending_sync(
-                        db,
-                        shortcode=shortcode,
-                        priority=priority,
-                        category=resolved or new_category or "",
-                        url=url,
-                        last_error=str(exc),
-                    )
-                    result["ok"] = False
-                    result["skipped"] = "quota_exhausted"
-                    result["error"] = str(exc)
-                    return result
-                raise
-            db.delete_category_youtube_playlist_item(video_id)
-            result["actions"].append(action)
+            return result
+        assert yt is not None
+        try:
+            yt.remove_playlist_item(existing["playlist_item_id"])
+        except Exception as exc:
+            if is_youtube_quota_error(exc):
+                mark_day_exhausted(db)
+                enqueue_pending_sync(
+                    db,
+                    shortcode=shortcode,
+                    priority=priority,
+                    category=new_category or "",
+                    url=url,
+                    last_error=str(exc),
+                )
+                result["ok"] = False
+                result["skipped"] = "quota_exhausted"
+                result["error"] = str(exc)
+                return result
+            raise
+        db.delete_category_youtube_playlist_item(video_id)
+        result["actions"].append(action)
+        return result
 
     if not resolved:
-        if not result["actions"]:
-            result["skipped"] = result["skipped"] or "no_target_category"
+        result["skipped"] = result["skipped"] or "no_target_category"
         return result
 
     mapped = db.get_category_youtube_playlist(resolved)
@@ -872,7 +881,18 @@ def sync_video_category(
         return result
 
     playlist_id = mapped["playlist_id"]
+    pending_remove = None
+    if needs_remove:
+        pending_remove = {
+            "op": "remove",
+            "category": existing.get("category_name"),
+            "playlist_id": existing.get("playlist_id"),
+            "playlist_item_id": existing.get("playlist_item_id"),
+            "dry_run": cfg.dry_run,
+        }
+
     if cfg.dry_run:
+        # Preview add-before-remove order for operators.
         result["actions"].append(
             {
                 "op": "would_add",
@@ -883,17 +903,23 @@ def sync_video_category(
                 "dry_run": True,
             }
         )
+        if pending_remove:
+            pending_remove = dict(pending_remove)
+            pending_remove["op"] = "would_remove"
+            result["actions"].append(pending_remove)
         return result
 
     assert yt is not None
+    # Strict moves: add to the new playlist first so a failed insert cannot
+    # leave the video in neither playlist.
+    item_id = None
     try:
         item_id = yt.add_video(playlist_id, video_id, position=0)
     except Exception as exc:
-        # Duplicate playlist item often returns 409; treat as already present.
         msg = str(exc)
         if "409" in msg or "duplicate" in msg.lower():
-            item_id = existing.get("playlist_item_id") if existing else None
-            item_id = item_id or f"duplicate:{video_id}"
+            # Do not invent synthetic item IDs — they cannot be deleted later.
+            item_id = None
             result["actions"].append(
                 {
                     "op": "already_on_playlist",
@@ -938,6 +964,38 @@ def sync_video_category(
         playlist_id=playlist_id,
         playlist_item_id=item_id,
     )
+
+    if pending_remove and pending_remove.get("playlist_item_id"):
+        # Skip delete when the "old" item is the same playlist (edge case).
+        if pending_remove.get("playlist_id") != playlist_id:
+            try:
+                yt.remove_playlist_item(pending_remove["playlist_item_id"])
+            except Exception as exc:
+                if is_youtube_quota_error(exc):
+                    # New membership already recorded; enqueue cleanup.
+                    mark_day_exhausted(db)
+                    enqueue_pending_sync(
+                        db,
+                        shortcode=shortcode,
+                        priority=priority,
+                        category=resolved,
+                        url=url,
+                        last_error=f"post_add_remove_failed:{exc}",
+                    )
+                    result["actions"].append(
+                        {
+                            **pending_remove,
+                            "op": "remove_deferred",
+                            "error": str(exc),
+                        }
+                    )
+                    result["ok"] = True
+                    result["warning"] = "added_but_old_membership_not_removed"
+                    db.delete_category_youtube_playlist_pending(shortcode)
+                    return result
+                raise
+            result["actions"].append(pending_remove)
+
     db.delete_category_youtube_playlist_pending(shortcode)
     return result
 
@@ -952,7 +1010,70 @@ def maybe_sync_after_category_change(
     is_hidden: bool = False,
     content_type: str = "youtube",
 ) -> None:
-    """Best-effort hook for analyze/edit paths; never raises to callers."""
+    """
+    Best-effort hook for analyze/edit paths; never raises to callers.
+
+    Rapid successive category edits for the same shortcode are debounced so
+    only the final category is synchronized (configurable sync_debounce_seconds).
+    """
+    try:
+        cfg = load_playlist_sync_config()
+        if not cfg.enabled:
+            return
+        payload = {
+            "shortcode": shortcode,
+            "url": url or "",
+            "new_category": new_category,
+            "old_category": old_category,
+            "is_hidden": is_hidden,
+            "content_type": content_type or "youtube",
+        }
+        if cfg.sync_debounce_seconds <= 0:
+            _run_debounced_playlist_sync(db, payload)
+            return
+        with _DEBOUNCE_LOCK:
+            _DEBOUNCE_PAYLOADS[shortcode] = payload
+            prior = _DEBOUNCE_TIMERS.pop(shortcode, None)
+            if prior is not None:
+                try:
+                    prior.cancel()
+                except Exception:
+                    pass
+            # Capture db in closure carefully — use get_db on flush if needed.
+            timer = threading.Timer(
+                cfg.sync_debounce_seconds,
+                _flush_debounced_playlist_sync,
+                args=(shortcode,),
+            )
+            timer.daemon = True
+            _DEBOUNCE_TIMERS[shortcode] = timer
+            timer.start()
+    except Exception as exc:
+        logger.warning("[category-playlists] sync failed for %s: %s", shortcode, exc)
+
+
+_DEBOUNCE_LOCK = threading.Lock()
+_DEBOUNCE_TIMERS: dict[str, threading.Timer] = {}
+_DEBOUNCE_PAYLOADS: dict[str, dict[str, Any]] = {}
+
+
+def _flush_debounced_playlist_sync(shortcode: str) -> None:
+    with _DEBOUNCE_LOCK:
+        _DEBOUNCE_TIMERS.pop(shortcode, None)
+        payload = _DEBOUNCE_PAYLOADS.pop(shortcode, None)
+    if not payload:
+        return
+    try:
+        from core.database import get_db
+
+        db = get_db()
+    except Exception:
+        return
+    _run_debounced_playlist_sync(db, payload)
+
+
+def _run_debounced_playlist_sync(db, payload: dict[str, Any]) -> None:
+    shortcode = payload.get("shortcode") or ""
     try:
         cfg = load_playlist_sync_config()
         if not cfg.enabled:
@@ -960,11 +1081,11 @@ def maybe_sync_after_category_change(
         result = sync_video_category(
             db,
             shortcode=shortcode,
-            url=url,
-            new_category=new_category,
-            old_category=old_category,
-            is_hidden=is_hidden,
-            content_type=content_type,
+            url=payload.get("url") or "",
+            new_category=payload.get("new_category"),
+            old_category=payload.get("old_category"),
+            is_hidden=bool(payload.get("is_hidden")),
+            content_type=payload.get("content_type") or "youtube",
             config=cfg,
             priority="new",
         )
@@ -1204,10 +1325,13 @@ def plan_reconcile_vs_rebuild(
             + UNITS_PLAYLIST_INSERT
             + write * desired
         )
-        # Formula: rebuild cheaper iff deletions > retained + 2
-        # (derived from 50*(add+del) vs 100+50*desired with desired=retained+add)
-        prefer_rebuild = deletions > (retained + 2)
         margin_units = reconcile_units - rebuild_units
+        # Formula: rebuild cheaper iff deletions > retained + 2
+        # Also require configured savings margin before recommending rebuild.
+        prefer_rebuild = (
+            deletions > (retained + 2)
+            and margin_units >= cfg.rebuild_savings_margin_units
+        )
         entry = {
             "category": cat,
             "desired": desired,
@@ -1219,7 +1343,11 @@ def plan_reconcile_vs_rebuild(
             "rebuild_units": rebuild_units,
             "prefer_rebuild": prefer_rebuild,
             "savings_if_rebuild": max(0, margin_units),
-            "break_even_rule": "rebuild cheaper when deletions > retained + 2",
+            "rebuild_savings_margin_units": cfg.rebuild_savings_margin_units,
+            "break_even_rule": (
+                "rebuild cheaper when deletions > retained + 2 and "
+                f"savings >= {cfg.rebuild_savings_margin_units} units"
+            ),
         }
         categories[cat] = entry
         totals["additions"] += additions

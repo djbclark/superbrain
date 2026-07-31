@@ -50,9 +50,12 @@ membership_mode = "move"   # or "add_only"
   sync with **priority=new** (uses the new-video quota reserve)
 - On category change: remove from previous playlist, add to new (idempotent)
   unless `membership_mode = "add_only"` (skips auto-delete; playlists become
-  cumulative — local mapping still tracks the primary category only)
+  cumulative — local mapping still tracks the primary category only). Strict
+  **move** mode adds the new membership **before** deleting the old one.
+- Live analyze/edit hooks debounce rapid category edits
+  (`sync_debounce_seconds`, default 2s) so only the final category is synced.
 - **Playlist order:** inserts use `snippet.position = 0` so watchlists read
-  newest → oldest (add-only default UX for ordering, not membership)
+  newest → oldest
 - Skips non-YouTube, hidden, and labels outside the taxonomy
 - Bulk backfill is via CLI (not automatic on every `recategorize.py apply`)
 

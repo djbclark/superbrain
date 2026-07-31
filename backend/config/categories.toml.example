@@ -69,5 +69,9 @@ idle_sleep_seconds = 180
 # "move" removes from the previous category playlist; "add_only" never
 # auto-deletes (playlists become cumulative/tag-like). Default stays "move".
 membership_mode = "move"
+# Debounce live category edits (seconds); 0 = sync immediately.
+sync_debounce_seconds = 2
+# Require at least this many units of savings before preferring rebuild.
+rebuild_savings_margin_units = 100
 # Leave empty / omit to sync all configured taxonomy categories.
 # categories = ["Sysadmin", "Science", "Technology", "History", "Humanities", "Politics", "Other"]
