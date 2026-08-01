@@ -27,7 +27,7 @@ boundary, and the next safe actions.
   [fork issue #2](https://github.com/djbclark/superbrain/issues/2)
 - Sensitive quota-form supplement, for agents authorized to read the private
   companion repository:
-  [`djbclark/site-private` `backup-superbrain-youtube-form` record](https://github.com/djbclark/site-private/blob/backup-superbrain-youtube-form/memory/reference_superbrain_youtube_api_quota_form.md)
+  [`djbclark/site-private` `backup-superbrain-youtube-form` record](https://github.com/djbclark/site-private/blob/master/memory/reference_superbrain_youtube_api_quota_form.md)
 
 ## Durable boundaries
 

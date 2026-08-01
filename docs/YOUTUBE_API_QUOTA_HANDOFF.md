@@ -6,7 +6,7 @@ SuperBrain YouTube Data API audit and quota-extension form. It was captured on
 
 Personal contact/address fields and the Google Cloud project identifier are
 intentionally excluded. Authorized agents can find those values in the
-[`site-private` companion record](https://github.com/djbclark/site-private/blob/backup-superbrain-youtube-form/memory/reference_superbrain_youtube_api_quota_form.md).
+[`site-private` companion record](https://github.com/djbclark/site-private/blob/master/memory/reference_superbrain_youtube_api_quota_form.md).
 
 Quota and usage figures are a dated snapshot. Recheck the remaining backfill
 count and requested quota before any later resubmission.
