@@ -127,12 +127,86 @@ def hours_until_pacific_midnight(now=None) -> float:
     return max(0.0, (nxt - current).total_seconds() / 3600.0)
 
 
+def _exception_chain(error: Optional[BaseException]) -> list[BaseException]:
+    """Walk __cause__ / __context__ so wrapped requests/urllib3 errors are visible."""
+    out: list[BaseException] = []
+    seen: set[int] = set()
+    cur: Optional[BaseException] = error
+    while cur is not None and id(cur) not in seen:
+        out.append(cur)
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return out
+
+
+def is_uncharged_transport_failure(
+    *,
+    http_status: Optional[int] = None,
+    error: Optional[BaseException] = None,
+) -> bool:
+    """
+    True when no HTTP response was received from Google (DNS, connect, TLS,
+    client timeout before headers, etc.). Those failures do not consume
+    YouTube quota and must not inflate the local ledger.
+    """
+    if http_status is not None or error is None:
+        return False
+    transport_types = (
+        ConnectionError,
+        TimeoutError,
+        OSError,
+    )
+    try:
+        import requests
+
+        transport_types = transport_types + (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectTimeout,
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.SSLError,
+        )
+    except Exception:
+        pass
+    for exc in _exception_chain(error):
+        if isinstance(exc, transport_types):
+            return True
+        name = type(exc).__name__
+        if name in {
+            "NameResolutionError",
+            "ConnectTimeoutError",
+            "MaxRetryError",
+            "NewConnectionError",
+            "ProtocolError",
+            "SSLError",
+        }:
+            return True
+        text = str(exc).lower()
+        if any(
+            needle in text
+            for needle in (
+                "nameresolutionerror",
+                "failed to resolve",
+                "nodename nor servname",
+                "name or service not known",
+                "temporary failure in name resolution",
+                "connection refused",
+                "network is unreachable",
+                "connection reset",
+            )
+        ):
+            return True
+    return False
+
+
 def classify_result(
     *,
     http_status: Optional[int] = None,
     error: Optional[BaseException] = None,
 ) -> str:
     if error is not None and http_status is None:
+        if is_uncharged_transport_failure(http_status=http_status, error=error):
+            return "transport_error"
         text = str(error).lower()
         if "403" in text or "quota" in text or "ratelimit" in text:
             return "quota_error"
@@ -180,12 +254,20 @@ def record_youtube_api_call(
     """
     Persist one API usage event. Does not store tokens, headers, or payloads.
 
-    Failed/invalid requests are still charged using the published cost when
-    known (Google counts them toward quota).
+    HTTP responses (including 4xx/5xx) are charged using the published cost when
+    known — Google counts them toward quota. Transport failures with no HTTP
+    status (DNS outages, connect errors, timeouts before headers) are recorded
+    but not charged on the local ledger.
     """
     cost = lookup_quota_cost(resource, method)
-    units = estimate_units(resource, method, pages=pages)
+    estimated = estimate_units(resource, method, pages=pages)
     result = result_class or classify_result(http_status=http_status, error=error)
+    transport_miss = result == "transport_error" or is_uncharged_transport_failure(
+        http_status=http_status, error=error
+    )
+    # Charge 0 when Google never answered; keep the estimate only as a comment
+    # via units_known + error_class forensics (units column stays honest at 0).
+    units = 0 if transport_miss else estimated
     day = pacific_day_key(now)
     error_class = ""
     if error is not None:
@@ -211,7 +293,7 @@ def record_youtube_api_call(
     }
     db.insert_youtube_api_usage_event(**event)
 
-    if update_ledger and units > 0:
+    if update_ledger and units > 0 and not transport_miss:
         db.record_youtube_quota_spend(
             day,
             units=units,
