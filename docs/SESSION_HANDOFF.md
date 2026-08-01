@@ -48,12 +48,20 @@ Fork #5 operator decisions (2026-07-31): playlist **rebuild execution** and **ho
 ## Upstream PR #7 — Android taxonomy sync
 
 [sidinsearch/superbrain#7](https://github.com/sidinsearch/superbrain/pull/7)
-(`draft/android-category-sync` → upstream `main`, tip `cfb2c96` (Android-only; rebuilt on upstream `main`))
+(`draft/android-category-sync` → upstream `main`, tip `5975a02` (Android-only; rebuilt on upstream `main`))
 
 Android client support for config-driven category taxonomy, gated so
 upstream mainline behavior is unchanged until `GET /taxonomy` exists.
-Reviewed and all findings fixed (deduplicated taxonomy HTTP calls, deferred
-taxonomy gate behind connectivity check, unconditional version persist).
+Reviewed and all findings fixed:
+- PostDetailScreen: category edit saves `cat.id` (not display name) — matches
+  upstream backend which stores categories by lowercase slug
+- PostDetailScreen: taxonomy fetch gated behind `testConnection()` to avoid
+  wasted 404 round-trip on upstream servers without `GET /taxonomy`
+- HomeScreen: `loadCategories` accepts optional pre-fetched taxonomy param;
+  post-sync reload reuses cached payload (eliminates 2 redundant HTTP calls
+  per cold boot)
+- api.ts: `getTaxonomy()` uses shared `TaxonomyPayload` type from
+  `taxonomySupport.ts`
 TypeScript passes.
 
 **Status:** OPEN on upstream. **2026-08-01:** head branch rebuilt as
@@ -62,7 +70,7 @@ upstream can merge without the fork’s backend/docs baggage. Same defensive
 `/taxonomy` gating as before. Keep `draft/android-category-sync` published until
 upstream merges (deleting the head branch prevents reopen).
 
-The Android changes are already on **fork** `main` from the earlier merge;
+The Android changes are already on **fork** `main` (ported `c195a38`);
 fork users do not need this PR. Upstream APK after merge should work against
 this fork’s taxonomy API and against stock upstream without it.
 
@@ -97,7 +105,7 @@ Quota instrumentation: [fork issue #5](https://github.com/djbclark/superbrain/is
 
 Branch tips: `dpr/test-live-api-isolation` `937704c`,
 `dpr/mobile-delta-sync-pagination` `44df0a0`, `prep/biome-tooling` `b5301e8`,
-`draft/android-category-sync` `cfb2c96` (Android-only vs upstream).
+`draft/android-category-sync` `5975a02` (Android-only vs upstream).
 
 ## YouTube quota request
 
