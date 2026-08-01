@@ -12,6 +12,7 @@ from core.youtube_quota import (
     classify_result,
     estimate_units,
     instrumented_request,
+    is_uncharged_transport_failure,
     lookup_quota_cost,
     record_youtube_api_call,
     usage_summary,
@@ -39,6 +40,18 @@ class TestQuotaCostTable(unittest.TestCase):
         self.assertEqual(
             classify_result(error=Exception("403 Forbidden quotaExceeded")),
             "quota_error",
+        )
+
+    def test_classify_transport_error(self):
+        err = ConnectionError(
+            "Failed to resolve 'oauth2.googleapis.com' "
+            "([Errno 8] nodename nor servname provided, or not known)"
+        )
+        self.assertTrue(is_uncharged_transport_failure(error=err))
+        self.assertEqual(classify_result(error=err), "transport_error")
+        # HTTP responses from Google are never treated as transport misses
+        self.assertFalse(
+            is_uncharged_transport_failure(http_status=503, error=err)
         )
 
 
@@ -118,6 +131,62 @@ class TestUsageEvents(unittest.TestCase):
         self.assertEqual(summary["totals"]["calls"], 2)
         self.assertEqual(summary["totals"]["units"], 1 + 50)
 
+    def test_dns_outage_does_not_charge_ledger(self):
+        """Reproduce 2026-08-01 incident: OAuth DNS failures must not burn local quota."""
+        dns_err = ConnectionError(
+            "HTTPSConnectionPool(host='oauth2.googleapis.com', port=443): "
+            "Max retries exceeded with url: /token (Caused by NameResolutionError("
+            "\"Failed to resolve 'oauth2.googleapis.com' "
+            "([Errno 8] nodename nor servname provided, or not known)\"))"
+        )
+
+        def _boom():
+            raise dns_err
+
+        with self.assertRaises(ConnectionError):
+            instrumented_request(
+                self.db,
+                do_request=_boom,
+                resource="playlistItems",
+                method="insert",
+                operation="sync_video_category",
+                priority="new",
+            )
+        # Burst of transport failures (same as the 200x incident)
+        for _ in range(5):
+            with self.assertRaises(ConnectionError):
+                instrumented_request(
+                    self.db,
+                    do_request=_boom,
+                    resource="playlistItems",
+                    method="insert",
+                    operation="sync_video_category",
+                    priority="new",
+                )
+
+        summary = usage_summary(self.db)
+        self.assertEqual(summary["totals"]["calls"], 6)
+        self.assertEqual(summary["totals"]["units"], 0)
+        self.assertEqual(summary["totals"]["failed"], 6)
+        ledger = self.db.get_youtube_quota_ledger(summary["day_key"])
+        self.assertTrue(
+            ledger is None or int(ledger.get("units_used") or 0) == 0,
+            f"transport failures must not spend local quota; ledger={ledger}",
+        )
+        event = record_youtube_api_call(
+            self.db,
+            resource="playlistItems",
+            method="insert",
+            http_status=None,
+            priority="new",
+            error=dns_err,
+        )
+        self.assertEqual(event["result_class"], "transport_error")
+        self.assertEqual(event["units"], 0)
+        ledger2 = self.db.get_youtube_quota_ledger(summary["day_key"])
+        self.assertTrue(
+            ledger2 is None or int(ledger2.get("units_used") or 0) == 0,
+        )
     def test_unknown_methods_listed(self):
         record_youtube_api_call(
             self.db,
