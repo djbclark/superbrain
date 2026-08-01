@@ -48,7 +48,7 @@ Fork #5 operator decisions (2026-07-31): playlist **rebuild execution** and **ho
 ## Upstream PR #7 — Android taxonomy sync
 
 [sidinsearch/superbrain#7](https://github.com/sidinsearch/superbrain/pull/7)
-(`draft/android-category-sync` → upstream `main`, tip `44a655d`)
+(`draft/android-category-sync` → upstream `main`, tip `cfb2c96` (Android-only; rebuilt on upstream `main`))
 
 Android client support for config-driven category taxonomy, gated so
 upstream mainline behavior is unchanged until `GET /taxonomy` exists.
@@ -56,10 +56,15 @@ Reviewed and all findings fixed (deduplicated taxonomy HTTP calls, deferred
 taxonomy gate behind connectivity check, unconditional version persist).
 TypeScript passes.
 
-**Status:** OPEN on upstream (reopened 2026-07-31 after accidental close).
-Merged into **fork** `main` only — that does **not** close the upstream PR.
-Keep branch `djbclark/superbrain:draft/android-category-sync` published until
-upstream merges #7 (deleting the head branch prevents reopen).
+**Status:** OPEN on upstream. **2026-08-01:** head branch rebuilt as
+**Android-only** (8 `superbrain-app/` files, one commit on upstream `main`) so
+upstream can merge without the fork’s backend/docs baggage. Same defensive
+`/taxonomy` gating as before. Keep `draft/android-category-sync` published until
+upstream merges (deleting the head branch prevents reopen).
+
+The Android changes are already on **fork** `main` from the earlier merge;
+fork users do not need this PR. Upstream APK after merge should work against
+this fork’s taxonomy API and against stock upstream without it.
 
 Fork draft PR #6 was closed after the fork merge (expected).
 
