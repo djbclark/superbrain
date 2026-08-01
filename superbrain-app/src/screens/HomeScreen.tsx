@@ -209,7 +209,7 @@ const HomeScreen = () => {
   ];
 
   const loadCategories = async (
-    prefetchedTaxonomy?: TaxonomyPayload | null,
+    prefetchedTaxonomy?: TaxonomyPayload | null | Promise<TaxonomyPayload | null>,
   ) => {
     try {
       // Reuse a pre-fetched taxonomy when available to avoid redundant HTTP calls.
@@ -279,11 +279,18 @@ const HomeScreen = () => {
       }
       setIsConfigured(true);
       // Fire categories, collections sync, and posts loading in parallel
-      // for faster first paint
+      // for faster first paint. Fetch /taxonomy exactly once here (not
+      // awaited yet — same in-flight promise shared with both loadCategories
+      // and loadPosts, each awaiting it only at the point they actually need
+      // it) instead of each independently re-fetching, which both wasted a
+      // redundant HTTP call and could race under flaky network (one fetch
+      // succeeding while the other timed out, leaving rendered chips
+      // inconsistent with what sync just persisted).
+      const taxonomyPromise = apiService.getTaxonomy().catch(() => null);
       const [, ,] = await Promise.all([
-        loadCategories(),
+        loadCategories(taxonomyPromise),
         collectionsService.syncFromBackend().catch(() => { /* offline */ }),
-        loadPosts(false),
+        loadPosts(false, taxonomyPromise),
       ]);
       // Reschedule Watch Later notifications with (possibly restored) collection data
       if (!deferNotificationPrompt) {
@@ -297,9 +304,29 @@ const HomeScreen = () => {
     }
   };
 
-  const loadPosts = async (forceRefresh: boolean = false) => {
-    // Reset taxonomy cache for this load cycle; re-fetched lazily below.
+  const loadPosts = async (
+    forceRefresh: boolean = false,
+    prefetchedTaxonomy?: TaxonomyPayload | null | Promise<TaxonomyPayload | null>,
+  ) => {
+    // Reset taxonomy cache for this load cycle; resolved lazily (below) at
+    // whichever point in this function first actually needs it, not eagerly
+    // here — keeps the fast local-data paint path (right below) unblocked by
+    // any network call, including a caller-supplied prefetch promise.
     taxonomyRef.current = undefined;
+    // Resolves the taxonomy exactly once per loadPosts call, reusing
+    // taxonomyRef.current if a previous call site within this same cycle
+    // already resolved it, otherwise awaiting prefetchedTaxonomy (a caller's
+    // in-flight fetch, e.g. bootstrap sharing one /taxonomy call with
+    // loadCategories instead of each independently re-fetching), otherwise
+    // fetching fresh.
+    const resolveTaxonomy = async (): Promise<TaxonomyPayload | null> => {
+      if (taxonomyRef.current !== undefined) return taxonomyRef.current;
+      const resolved = prefetchedTaxonomy !== undefined
+        ? await prefetchedTaxonomy
+        : await apiService.getTaxonomy().catch(() => null);
+      taxonomyRef.current = resolved;
+      return resolved;
+    };
     try {
       // Reconcile: if a post was in the failed list AND still stuck in analyzing, clean it up.
       const failedList = await postsCache.getFailedPosts();
@@ -342,13 +369,11 @@ const HomeScreen = () => {
           if (!isOnlineForGate) {
             return;
           }
-          const taxonomy = await apiService.getTaxonomy().catch(() => null);
+          const taxonomy = await resolveTaxonomy();
           if (!isTaxonomyApiActive(taxonomy)) {
             return;
           }
           // taxonomy is active — fall through to background sync below.
-          // Stash result so syncIfNeeded and post-sync reload can reuse it.
-          taxonomyRef.current = taxonomy;
         }
       } else {
         // No local data at all — show loading spinner
@@ -366,10 +391,7 @@ const HomeScreen = () => {
 
         // forceFull / taxonomy_version resync only activate when GET /taxonomy exists
         // (see syncService); without it this matches upstream delta-only sync.
-        // Reuse any taxonomy payload already fetched above to avoid a redundant call.
-        const taxonomy = taxonomyRef.current !== undefined
-          ? taxonomyRef.current
-          : await apiService.getTaxonomy().catch(() => null);
+        const taxonomy = await resolveTaxonomy();
         const dataChanged = await syncService.syncIfNeeded(forceRefresh, taxonomy);
 
         // If sync brought new data, re-read from local DB and update UI

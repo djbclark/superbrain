@@ -421,7 +421,7 @@ class ApiService {
       const baseUrl = await this.getBaseUrl();
       const response = await axios.get<{
         success: boolean;
-        categories: Array<{ id: string; name: string; precedence: number; guidance: string }>;
+        categories: Array<{ id: string; name: string; precedence?: number; guidance?: string }>;
         allow_multiple_categories: boolean;
         fallback_category: string;
         use_default_categories: boolean;
