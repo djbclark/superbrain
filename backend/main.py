@@ -628,46 +628,163 @@ def main():
         run_playlist_import,
     )
 
-    parser = argparse.ArgumentParser(description="SuperBrain Content Analyzer")
-    parser.add_argument("url", nargs="?", default="", help="URL to analyze (Instagram / YouTube / Web / Playlist)")
-    parser.add_argument("-p", "--playlist", help="URL of a YouTube playlist to import and analyze")
-    parser.add_argument("-c", "--cookies", help="Cookies for yt-dlp (browser name like 'chrome' or path to cookies.txt)")
-    parser.add_argument("-s", "--start-index", type=int, default=1, help="Start processing playlist at 1-based index (default: 1)")
-    parser.add_argument("-j", "--workers", "--parallel", type=int, default=1, help="Number of parallel workers (default: 1 = one at a time)")
-    parser.add_argument("--all-at-once", action="store_true", default=False, help="Process all playlist items concurrently at once (5 workers)")
-    parser.add_argument("-y", "--youtube-transcripts", action="store_true", default=False, help="Enable YouTube native transcript extraction")
-    parser.add_argument("-m", "--transcribe-seconds", type=int, default=0, help="Duration of audio to transcribe in seconds (default: 0 = full video audio)")
-    parser.add_argument(
+    parser = argparse.ArgumentParser(
+        prog="superbrain",
+        description="SuperBrain Content Analyzer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+----------------------------------------------------------------------
+Category → YouTube playlists (optional; skip if unused)
+  Setup once:
+    superbrain --youtube-connect
+  Historic backfill — pick one mode:
+    superbrain --sync-category-playlists-start
+        enable reboot-safe worker (API keeps it running across reboots)
+    superbrain --sync-category-playlists [--sync-category-playlists-limit N]
+        foreground one-shot (does not enable reboot-safe mode)
+  Cancel reboot-safe mode:
+    superbrain --sync-category-playlists-stop
+  Inspect:
+    superbrain --category-playlists-status
+    superbrain --youtube-quota-stats [--youtube-quota-stats-days N]
+
+Local runtime deploy (this fork's ~/.superbrain-server only)
+  superbrain --deploy-local [--restart]
+  If reboot-safe backfill is running, stop it before deploy:
+    superbrain --sync-category-playlists-stop
+    superbrain --deploy-local
+    superbrain --sync-category-playlists-start
+----------------------------------------------------------------------
+Docs: docs/CATEGORY_YOUTUBE_PLAYLISTS.md
+""",
+    )
+
+    analyze = parser.add_argument_group(
+        "analyze a URL",
+        "Default mode when a URL (or --playlist) is given.",
+    )
+    analyze.add_argument(
+        "url",
+        nargs="?",
+        default="",
+        help="URL to analyze (Instagram / YouTube / Web / Playlist)",
+    )
+    analyze.add_argument(
+        "-p",
+        "--playlist",
+        help="URL of a YouTube playlist to import and analyze",
+    )
+    analyze.add_argument(
+        "-c",
+        "--cookies",
+        help="Cookies for yt-dlp (browser name like 'chrome' or path to cookies.txt)",
+    )
+    analyze.add_argument(
+        "-s",
+        "--start-index",
+        type=int,
+        default=1,
+        help="Start processing playlist at 1-based index (default: 1)",
+    )
+    analyze.add_argument(
+        "-j",
+        "--workers",
+        "--parallel",
+        type=int,
+        default=1,
+        help="Number of parallel workers (default: 1 = one at a time)",
+    )
+    analyze.add_argument(
+        "--all-at-once",
+        action="store_true",
+        default=False,
+        help="Process all playlist items concurrently at once (5 workers)",
+    )
+    analyze.add_argument(
+        "-y",
+        "--youtube-transcripts",
+        action="store_true",
+        default=False,
+        help="Enable YouTube native transcript extraction",
+    )
+    analyze.add_argument(
+        "-m",
+        "--transcribe-seconds",
+        type=int,
+        default=0,
+        help="Duration of audio to transcribe in seconds (default: 0 = full video audio)",
+    )
+
+    youtube_oauth = parser.add_argument_group(
+        "YouTube OAuth",
+        "Run before category playlist features. Re-run after scope upgrades "
+        "(e.g. youtube.readonly → youtube).",
+    )
+    youtube_oauth.add_argument(
         "--youtube-connect",
         action="store_true",
         help="Open Google OAuth in a browser to (re)authorize YouTube access, then exit",
     )
-    parser.add_argument(
-        "--sync-category-playlists",
-        action="store_true",
-        help="Backfill existing YouTube analyses into category playlists, then exit",
+
+    cat_playlists = parser.add_argument_group(
+        "category → YouTube playlists (optional)",
+        "Depends on a prior --youtube-connect with playlist-capable scope. "
+        "After connect, new analyses sync live; use these flags for status, "
+        "historic backfill, and quota inspection.",
     )
-    parser.add_argument(
+    cat_playlists.add_argument(
         "--category-playlists-status",
         action="store_true",
-        help="Show category→playlist sync status, then exit",
+        help="Show category→playlist sync status (includes backfill enable/running), then exit",
     )
-    parser.add_argument(
+    cat_playlists.add_argument(
+        "--sync-category-playlists-start",
+        action="store_true",
+        help="Enable reboot-safe historic backfill (API supervises the worker; survives reboot)",
+    )
+    cat_playlists.add_argument(
+        "--sync-category-playlists-stop",
+        action="store_true",
+        help="Cancel reboot-safe historic backfill (clears enable flag and stops the worker)",
+    )
+    cat_playlists.add_argument(
+        "--sync-category-playlists",
+        action="store_true",
+        help="Run historic backfill in the foreground (one-shot; does not enable reboot-safe mode)",
+    )
+    cat_playlists.add_argument(
         "--sync-category-playlists-limit",
         type=int,
         default=0,
-        help="With --sync-category-playlists, max videos to process (0 = all)",
+        help="Requires --sync-category-playlists: max videos to process (0 = all)",
     )
-    parser.add_argument(
+    cat_playlists.add_argument(
         "--youtube-quota-stats",
         action="store_true",
         help="Show durable YouTube Data API usage statistics, then exit",
     )
-    parser.add_argument(
+    cat_playlists.add_argument(
         "--youtube-quota-stats-days",
         type=int,
         default=1,
-        help="With --youtube-quota-stats, rolling Pacific-day window (default: 1)",
+        help="Requires --youtube-quota-stats: rolling Pacific-day window (default: 1)",
+    )
+
+    deploy = parser.add_argument_group(
+        "local runtime deploy (this fork)",
+        "Ships the git checkout into ~/.superbrain-server. "
+        "Not used by stock upstream installs. --restart requires --deploy-local. "
+        "Stop reboot-safe backfill before deploying (see epilog).",
+    )
+    deploy.add_argument(
+        "--deploy-local",
+        action="store_true",
+        help="Deploy reviewed code from the git checkout into ~/.superbrain-server",
+    )
+    deploy.add_argument(
+        "--restart",
+        action="store_true",
+        help="Requires --deploy-local: also restart the SuperBrain API service",
     )
 
     args = parser.parse_args()
@@ -677,9 +794,22 @@ def main():
 
         sys.exit(run_local_browser_connect())
 
+    if args.deploy_local:
+        from core.local_deploy import run_deploy_local
+
+        sys.exit(run_deploy_local(restart=args.restart))
+
+    if args.restart:
+        parser.error("--restart requires --deploy-local")
+
+    if args.sync_category_playlists_limit and not args.sync_category_playlists:
+        parser.error("--sync-category-playlists-limit requires --sync-category-playlists")
+
     if (
         args.category_playlists_status
         or args.sync_category_playlists
+        or args.sync_category_playlists_start
+        or args.sync_category_playlists_stop
         or args.youtube_quota_stats
     ):
         from core.category_playlists import (
@@ -688,10 +818,33 @@ def main():
             print_category_playlists_status,
             print_youtube_quota_stats,
         )
+        from core.playlist_backfill_service import (
+            start_category_playlist_backfill,
+            stop_category_playlist_backfill,
+        )
+        import json
 
         ensure_runtime_env_for_cli(entrypoint=Path(__file__))
         if args.youtube_quota_stats:
             sys.exit(print_youtube_quota_stats(days=args.youtube_quota_stats_days))
+        if args.sync_category_playlists_stop:
+            print(
+                json.dumps(
+                    stop_category_playlist_backfill(),
+                    indent=2,
+                    default=str,
+                )
+            )
+            sys.exit(0)
+        if args.sync_category_playlists_start:
+            print(
+                json.dumps(
+                    start_category_playlist_backfill(),
+                    indent=2,
+                    default=str,
+                )
+            )
+            sys.exit(0)
         if args.category_playlists_status:
             sys.exit(print_category_playlists_status())
         sys.exit(

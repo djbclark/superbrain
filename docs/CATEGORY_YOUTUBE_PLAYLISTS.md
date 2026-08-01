@@ -1,29 +1,42 @@
 # Category → YouTube playlists
 
+> **Optional feature.** If you are not mirroring SuperBrain categories onto
+> YouTube playlists, **skip this entire document.**
+
 Mirror configured SuperBrain taxonomy categories onto YouTube playlists and keep
 playlist membership in sync when a video’s category is assigned or changed.
+
+**Operator entrypoint:** `superbrain …` (not curl, not raw `python`). HTTP
+endpoints below are for the app and automation.
+
+---
+
+## Quick start
+
+```bash
+superbrain --youtube-connect                 # once (or after OAuth scope change)
+superbrain --category-playlists-status       # config + quota + backfill state
+# historic backfill — choose one:
+superbrain --sync-category-playlists-start   # reboot-safe (recommended for long runs)
+#   or:
+superbrain --sync-category-playlists         # foreground one-shot
+superbrain --sync-category-playlists-stop    # cancel reboot-safe mode only
+```
+
+See `superbrain --help` (groups + process epilog) for flag dependencies.
+
+---
 
 ## Prerequisites
 
 1. Taxonomy cutover complete (`config/categories.toml` in the runtime).
-2. YouTube OAuth client + refresh token with the full **`youtube`** scope
-   (playlist create/modify). Subscription-only installs that authorized
-   `youtube.readonly` must **re-authorize** after deploying this change.
-
-   Easiest (local API running):
-
-   ```bash
-   superbrain --youtube-connect
-   ```
-
-   That opens Google consent in your browser and waits for the localhost
-   callback. Equivalently, open
-   `http://127.0.0.1:5000/api/youtube/oauth/start?token=<token-from-token.txt>`
-   in a browser on this machine.
-3. Playlist sync turns on automatically after a successful
-   `superbrain --youtube-connect` (writes `enabled=true` / `dry_run=false`
-   into live `categories.toml` and creates/adopts category playlists).
-   You can still override settings by hand if needed:
+2. YouTube OAuth with the full **`youtube`** scope (playlist create/modify).
+   Subscription-only installs that authorized `youtube.readonly` must
+   re-authorize: `superbrain --youtube-connect`.
+3. Playlist sync turns on automatically after a successful connect (writes
+   `enabled=true` / `dry_run=false` into live `categories.toml` and
+   creates/adopts category playlists). Override under `[youtube_playlists]`
+   if needed:
 
 ```toml
 [youtube_playlists]
@@ -41,7 +54,7 @@ membership_mode = "move"   # or "add_only"
 # categories = ["Sysadmin", "Science"]   # optional subset; omit = all taxonomy
 ```
 
-`deploy-local.sh` does **not** overwrite `categories.toml`.
+---
 
 ## Behavior
 
@@ -59,15 +72,16 @@ membership_mode = "move"   # or "add_only"
 - **Playlist order:** inserts use `snippet.position = 0` so watchlists read
   newest → oldest
 - Skips non-YouTube, hidden, and labels outside the taxonomy
-- Bulk backfill is via CLI (not automatic on every `recategorize.py apply`)
+- Bulk historic backfill is via `superbrain` (not automatic on every
+  recategorize apply)
+
+---
 
 ## Quota-aware pacing
 
 YouTube Data API daily quota resets at **Pacific midnight**. SuperBrain keeps a
 local ledger (`youtube_api_quota_ledger`) and a deferred queue
 (`category_youtube_playlist_pending`).
-
-Defaults (override under `[youtube_playlists]`):
 
 | Knob | Default | Meaning |
 |------|---------|---------|
@@ -77,75 +91,115 @@ Defaults (override under `[youtube_playlists]`):
 | `near_reset_historic_pct` | 0.90 | Near reset, spend remaining budget down to this ceiling (leave ~10% buffer) |
 | `fresh_window_hours` | 24 | Unsynced analyses this new count as `priority=new` during backfill |
 
-Estimated unit costs tracked locally: `playlistItems.insert/delete` = 50,
-`playlists.list` = 1/page, `playlists.insert` = 50.
+Estimated unit costs: `playlistItems.insert/delete` = 50, `playlists.list` =
+1/page, `playlists.insert` = 50.
 
-On Google 403/quota errors the day is marked exhausted, the video is enqueued
-with the correct priority, and the worker sleeps until Pacific midnight (or
-idles in short chunks while waiting for the near-reset historic window). Live
-`priority=new` inserts that hit budget/403 are queued and drained first when
-quota returns.
+On Google 403/quota errors the day is marked exhausted, the video is enqueued,
+and the worker sleeps until Pacific midnight (or idles until the near-reset
+window). Live `priority=new` inserts that hit budget/403 are queued and drained
+first when quota returns.
 
-This aligns with fork issue #5 (quota-aware pacing) while keeping add-only +
-position-0 as the default playlist UX.
+`superbrain --youtube-quota-stats` prints durable usage events
+(`youtube_api_usage_events`) plus a local-only reconcile-vs-rebuild planner
+(never automatic).
 
-## CLI
+Concurrent CLI runs use flock locks under `~/.superbrain-server/locks/` for
+`--youtube-connect`, `--sync-category-playlists`, `--category-playlists-status`,
+and `--youtube-quota-stats`. Start/stop only toggle the enable flag.
 
-With the local API/runtime available:
+---
 
-```bash
-superbrain --youtube-connect              # OAuth + auto-enable playlists
-superbrain --category-playlists-status    # config + quota ledger + pending
-superbrain --sync-category-playlists      # quota-aware newest-first backfill
-superbrain --sync-category-playlists --sync-category-playlists-limit 20
-```
+## CLI reference
 
-`superbrain --sync-category-playlists`:
+| Flag | Role | Depends on / notes |
+|------|------|--------------------|
+| `--youtube-connect` | OAuth + auto-enable playlists | First step |
+| `--category-playlists-status` | Status JSON (includes `backfill`) | After connect |
+| `--sync-category-playlists-start` | Enable reboot-safe historic backfill | After connect; alternative to foreground sync |
+| `--sync-category-playlists-stop` | Cancel reboot-safe backfill | Only needed if start was used |
+| `--sync-category-playlists` | Foreground one-shot backfill | Does **not** enable reboot-safe mode |
+| `--sync-category-playlists-limit N` | Cap for foreground sync | Requires `--sync-category-playlists` |
+| `--youtube-quota-stats` | Usage rollup | Optional |
+| `--youtube-quota-stats-days N` | Window for stats | Requires `--youtube-quota-stats` |
 
-1. Ensures playlists once (budget-aware). Skips `playlists.list` when local
-   mappings already cover every category, when the Pacific day is marked
-   exhausted, or when a successful list already ran today
-   (`playlists_listed_at` on the quota ledger). Use `force_list=True` only from
-   explicit maintenance callers.
-2. Drains pending **new** first, then pending historic.
-3. Syncs unsynced rows **newest-first** (`analyzed_at`, then `categorized_at`,
-   then `updated_at`).
-4. Caps historic spend early in the day; idles in short sleeps until the
-   near-reset window (or midnight), instead of a single blind 24h sleep.
+Foreground `--sync-category-playlists` scheduler:
 
-```bash
-superbrain --youtube-quota-stats           # durable API usage for today (PT)
-superbrain --youtube-quota-stats --youtube-quota-stats-days 7
-```
+1. Ensures playlists once (budget-aware; skips redundant `playlists.list`).
+2. Drains pending **new**, then pending historic.
+3. Syncs unsynced rows newest-first.
+4. Caps historic spend early in the day; idles until near-reset or midnight.
 
-Usage events are stored in `youtube_api_usage_events` (no tokens/headers/payloads)
-with a versioned cost table (`core/youtube_quota.py`, currently dated
-`2026-07-31`). Failed calls are still charged when the method cost is known.
-`--youtube-quota-stats` also prints a local-only reconcile-vs-rebuild planner
-(rebuild is never automatic; cheaper only when `deletions > retained + 2` per
-category under equal 50-unit write costs).
+---
 
-Concurrent accidental runs are blocked with exclusive flock locks under
-`~/.superbrain-server/locks/` for `--youtube-connect`,
-`--sync-category-playlists`, `--category-playlists-status`, and
-`--youtube-quota-stats`.
+## API (app / automation)
 
-## API
+Prefer `superbrain` for operator tasks. These endpoints mirror the same
+behavior for clients:
 
-| Method | Path | Notes |
-|--------|------|--------|
-| GET | `/api/youtube/oauth/status` | Includes `oauth_scope` + playlist config |
-| GET | `/api/youtube/category-playlists/status` | Config + mappings + quota/usage |
-| GET | `/api/youtube/quota/stats` | Durable usage rollup (`?days=1`) |
-| POST | `/api/youtube/category-playlists/ensure` | Create/adopt playlists |
-| POST | `/api/youtube/category-playlists/sync/{shortcode}` | Sync one analysis |
+| Method | Path | Same as |
+|--------|------|---------|
+| GET | `/api/youtube/oauth/status` | — |
+| GET | `/api/youtube/category-playlists/status` | `--category-playlists-status` |
+| POST | `/api/youtube/category-playlists/backfill/start` | `--sync-category-playlists-start` |
+| POST | `/api/youtube/category-playlists/backfill/stop` | `--sync-category-playlists-stop` |
+| GET | `/api/youtube/quota/stats` | `--youtube-quota-stats` |
+| POST | `/api/youtube/category-playlists/ensure` | (maintenance) |
+| POST | `/api/youtube/category-playlists/sync/{shortcode}` | (single item) |
 
 All require the API key. Ensure/sync require `enabled=true`.
 
+---
+
 ## Rollout checklist
 
-1. Deploy code; restart LaunchAgent when the queue is in a safe state.
-2. Run `superbrain --youtube-connect` (re-authorize + auto-enable playlist sync + ensure playlists).
+1. Deploy reviewed code into the runtime (see [Local fork runtime](#local-fork-runtime-skip-if-uninterested) if applicable).
+2. `superbrain --youtube-connect`
 3. New YouTube analyses and manual category edits sync going forward.
-4. Optional: backfill history with `superbrain --sync-category-playlists`
-   (stop any old sleeper first so the new scheduler takes the lock).
+4. Optional historic backfill: `--sync-category-playlists-start` or
+   `--sync-category-playlists`. Cancel reboot-safe mode with
+   `--sync-category-playlists-stop`.
+
+---
+
+<a id="local-fork-runtime-skip-if-uninterested"></a>
+
+## Local fork runtime (skip if uninterested)
+
+> **This section is only for the fork’s LaunchAgent install** at
+> `~/.superbrain-server` (`com.djbclark.superbrain`). Stock upstream /
+> `superbrain-server` npm installs can ignore everything below.
+
+### Reboot-safe historic backfill
+
+Same pattern as upstream optional features (`config/ngrok_enabled.txt`):
+
+- Enable file: `~/.superbrain-server/config/category_playlist_backfill_enabled.txt`
+- While present, the API process supervises `superbrain --sync-category-playlists`
+  (including after reboot).
+- Log: `~/Library/Logs/superbrain/category-playlist-backfill.log`
+
+```bash
+superbrain --sync-category-playlists-start
+superbrain --category-playlists-status    # "backfill": {enabled, process_running, …}
+superbrain --sync-category-playlists-stop
+```
+
+### Deploy code into the runtime
+
+```bash
+superbrain --deploy-local                 # checkout → ~/.superbrain-server
+superbrain --deploy-local --restart       # also restart the API service
+```
+
+`--restart` requires `--deploy-local`. Source defaults to `~/src/superbrain`
+(or set `SUPERBRAIN_SOURCE_DIR`). Deploy does **not** overwrite
+`categories.toml`.
+
+If reboot-safe backfill is running, stop it first (deploy refuses while a
+playlist worker is active):
+
+```bash
+superbrain --sync-category-playlists-stop
+superbrain --deploy-local
+superbrain --sync-category-playlists-start
+```

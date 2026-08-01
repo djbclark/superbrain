@@ -77,7 +77,8 @@ superbrain/                          (Root)
 │   │   ├── model_rankings.json
 │   │   └── openrouter_free_models.json
 │   ├── scripts/
-│   │   ├── deploy-local.sh          (rsync allow-list → ~/.superbrain-server)
+│   │   ├── deploy-local.sh          (rsync allow-list → ~/.superbrain-server;
+│   │   │                            operator: superbrain --deploy-local)
 │   │   └── recategorize.py          (metadata-only taxonomy migration)
 │   ├── tests/                       (Smoke + unit tests)
 │   └── requirements.txt

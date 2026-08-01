@@ -38,7 +38,7 @@
 | **Database** | SQLite (`superbrain.db`) with WAL | `backend/core/database.py` |
 | **Analyzers** | AI content analysis modules | `backend/analyzers/` |
 | **API** | REST endpoints and authentication | `backend/api.py` |
-| **Local runtime** | Deploy target for this fork | `~/.superbrain-server` via `backend/scripts/deploy-local.sh` |
+| **Local runtime** | Deploy target for this fork | `~/.superbrain-server` via `superbrain --deploy-local` |
 
 ## Directory Structure
 
@@ -63,6 +63,7 @@ superbrain/
 │   │   └── .api_keys                 # Local only (gitignored)
 │   ├── scripts/
 │   │   ├── deploy-local.sh           # Sync code → ~/.superbrain-server
+│   │   │                             # (operator: superbrain --deploy-local)
 │   │   └── recategorize.py           # Metadata-only taxonomy migration
 │   └── tests/
 ├── superbrain-cli/           # npm wrapper that installs into ~/.superbrain-server
