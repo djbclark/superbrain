@@ -1,6 +1,7 @@
 import axios, { AxiosError } from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Post, ApiResponse, QueueStatus, DatabaseStats, RetryQueueItem, Collection } from '../types';
+import { TaxonomyPayload } from './taxonomySupport';
 
 const ACCESS_TOKEN_LENGTH = 8;
 
@@ -414,13 +415,7 @@ class ApiService {
     }
   }
 
-  async getTaxonomy(): Promise<{
-    categories: Array<{ id: string; name: string; precedence: number; guidance: string }>;
-    allow_multiple_categories: boolean;
-    fallback_category: string;
-    use_default_categories: boolean;
-    taxonomy_version: string;
-  } | null> {
+  async getTaxonomy(): Promise<TaxonomyPayload | null> {
     try {
       const headers = await this.getHeaders();
       const baseUrl = await this.getBaseUrl();

@@ -58,6 +58,10 @@ const PostDetailScreen = ({ route, navigation }: Props) => {
     let cancelled = false;
     (async () => {
       try {
+        // Gate behind connectivity to avoid a wasted 404 round-trip on
+        // upstream servers that lack GET /taxonomy.
+        const isOnline = await apiService.testConnection().catch(() => false);
+        if (!isOnline || cancelled) return;
         const taxonomy = await apiService.getTaxonomy();
         if (cancelled) return;
         // Only replace the built-in picker when the server exposes taxonomy.
@@ -441,7 +445,7 @@ const PostDetailScreen = ({ route, navigation }: Props) => {
                           backgroundColor: catColor + '10',
                         },
                       ]}
-                      onPress={() => setEditedCategory(cat.name)}
+                      onPress={() => setEditedCategory(cat.id)}
                     >
                       <Ionicons
                         name={cat.icon as any}

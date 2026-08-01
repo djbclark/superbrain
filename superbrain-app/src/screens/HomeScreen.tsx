@@ -208,11 +208,17 @@ const HomeScreen = () => {
     },
   ];
 
-  const loadCategories = async () => {
+  const loadCategories = async (
+    prefetchedTaxonomy?: TaxonomyPayload | null,
+  ) => {
     try {
+      // Reuse a pre-fetched taxonomy when available to avoid redundant HTTP calls.
+      // On init (no prefetch), fetch taxonomy alongside categories.
       const [cats, taxonomy] = await Promise.all([
         apiService.getCategories(),
-        apiService.getTaxonomy().catch(() => null),
+        prefetchedTaxonomy !== undefined
+          ? Promise.resolve(prefetchedTaxonomy)
+          : apiService.getTaxonomy().catch(() => null),
       ]);
 
       // No GET /taxonomy (upstream today) → keep full built-in pill set + counts.
@@ -370,7 +376,7 @@ const HomeScreen = () => {
         if (dataChanged || forceRefresh) {
           // Category chip reload is taxonomy-aware; skip extra work on mainline.
           if (isTaxonomyApiActive(taxonomy)) {
-            await loadCategories();
+            await loadCategories(taxonomy);
           }
           const freshPosts = await localDb.getAllPosts();
           if (freshPosts.length > 0) {
