@@ -97,7 +97,7 @@ Quota instrumentation: [fork issue #5](https://github.com/djbclark/superbrain/is
 
 Branch tips: `dpr/test-live-api-isolation` `937704c`,
 `dpr/mobile-delta-sync-pagination` `44df0a0`, `prep/biome-tooling` `b5301e8`,
-`draft/android-category-sync` `44a655d`.
+`draft/android-category-sync` `cfb2c96` (Android-only vs upstream).
 
 ## YouTube quota request
 
