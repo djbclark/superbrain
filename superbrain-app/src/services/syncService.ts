@@ -59,13 +59,47 @@ async function deltaSync(): Promise<number> {
 
   // Fetch every changed row before advancing the cursor. A single delta can
   // exceed the server's page size after a large playlist import.
+  //
+  // Defensive against a server that doesn't implement `offset` (this PR adds
+  // client-side pagination without a matching backend change — if `/sync`
+  // silently ignores an unknown `offset` param and keeps returning the same
+  // page, `hasMore`'s length-based fallback would never go false and this
+  // loop would never terminate). Two independent safety nets:
+  //   1. Hard cap on page count — always terminates regardless of server behavior.
+  //   2. Non-advancing-cursor detection — if consecutive pages start with the
+  //      same post, the server isn't honoring `offset`; stop and warn rather
+  //      than loop forever accumulating duplicates.
+  const MAX_SYNC_PAGES = 50; // 50 * BATCH_SIZE(200) = 10,000 posts per delta sync
   const changedPosts: Post[] = [];
   let offset = 0;
-  while (true) {
+  let previousFirstShortcode: string | undefined;
+  let hitPageCap = true;
+  for (let pageNum = 0; pageNum < MAX_SYNC_PAGES; pageNum++) {
     const page = await apiService.syncPosts(since, BATCH_SIZE, offset);
+    if (page.data.length === 0) {
+      hitPageCap = false;
+      break;
+    }
+    const firstShortcode = page.data[0].shortcode;
+    if (firstShortcode === previousFirstShortcode) {
+      console.warn(
+        '[Sync] Pagination cursor did not advance (server may not support offset) — stopping delta sync early'
+      );
+      hitPageCap = false;
+      break;
+    }
+    previousFirstShortcode = firstShortcode;
     changedPosts.push(...page.data);
     offset += page.data.length;
-    if (!page.hasMore || page.data.length === 0) break;
+    if (!page.hasMore) {
+      hitPageCap = false;
+      break;
+    }
+  }
+  if (hitPageCap) {
+    console.warn(
+      `[Sync] Delta sync hit the ${MAX_SYNC_PAGES}-page safety cap — some changes may not be synced this cycle; next sync will continue from the last successful point.`
+    );
   }
 
   // Filter out hidden (soft-deleted) posts for upsert; delete them locally instead
