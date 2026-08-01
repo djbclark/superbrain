@@ -73,11 +73,11 @@ async function deltaSync(): Promise<number> {
   const changedPosts: Post[] = [];
   let offset = 0;
   let previousFirstShortcode: string | undefined;
-  let hitPageCap = true;
+  let paginationComplete = false;
   for (let pageNum = 0; pageNum < MAX_SYNC_PAGES; pageNum++) {
     const page = await apiService.syncPosts(since, BATCH_SIZE, offset);
     if (page.data.length === 0) {
-      hitPageCap = false;
+      paginationComplete = true;
       break;
     }
     const firstShortcode = page.data[0].shortcode;
@@ -85,20 +85,20 @@ async function deltaSync(): Promise<number> {
       console.warn(
         '[Sync] Pagination cursor did not advance (server may not support offset) — stopping delta sync early'
       );
-      hitPageCap = false;
       break;
     }
     previousFirstShortcode = firstShortcode;
     changedPosts.push(...page.data);
     offset += page.data.length;
     if (!page.hasMore) {
-      hitPageCap = false;
+      paginationComplete = true;
       break;
     }
   }
-  if (hitPageCap) {
+  if (!paginationComplete) {
     console.warn(
-      `[Sync] Delta sync hit the ${MAX_SYNC_PAGES}-page safety cap — some changes may not be synced this cycle; next sync will continue from the last successful point.`
+      `[Sync] Delta sync stopped before fetching all changes (page cap or non-advancing cursor) — ` +
+      `lastSyncTime will NOT advance, so the next sync retries this same window from '${since}'.`
     );
   }
 
@@ -127,8 +127,12 @@ async function deltaSync(): Promise<number> {
     await localDb.deletePosts(deletedShortcodes);
   }
 
-  // Update sync cursor
-  await localDb.setLastSyncTime(new Date().toISOString());
+  // Update sync cursor — only when pagination genuinely completed. Advancing
+  // this after an incomplete cycle (page cap / non-advancing cursor) would
+  // permanently skip whatever changes existed past the point sync stopped.
+  if (paginationComplete) {
+    await localDb.setLastSyncTime(new Date().toISOString());
+  }
 
   const totalChanges = toUpsert.length + deletedShortcodes.length;
   if (totalChanges > 0) {
