@@ -14,19 +14,22 @@ Live playlist backfill is sleeping until Pacific midnight (~03:00 ET /
 Babysit commands:
 
 ```bash
-pgrep -lf 'sync-category-playlists'
-tail -n 40 ~/Library/Logs/superbrain/category-playlist-backfill.log
 superbrain --category-playlists-status
 superbrain --youtube-quota-stats
+tail -n 40 ~/Library/Logs/superbrain/category-playlist-backfill.log
 ```
 
-Restart backfill only if dead (deploy refuses while sync is running):
+Manage reboot-safe backfill / local deploy (see also
+`docs/CATEGORY_YOUTUBE_PLAYLISTS.md` → “Local fork runtime”):
 
 ```bash
-pkill -f 'main.py --sync-category-playlists' || true
-bash ~/src/superbrain/backend/scripts/deploy-local.sh
-nohup superbrain --sync-category-playlists >> ~/Library/Logs/superbrain/category-playlist-backfill.log 2>&1 &
+superbrain --sync-category-playlists-stop
+superbrain --deploy-local
+superbrain --sync-category-playlists-start
 ```
+
+Enable flag: `~/.superbrain-server/config/category_playlist_backfill_enabled.txt`.
+After stop, reboot will **not** restart backfill until start is run again.
 
 ## Fork playlist / quota work (shipped on main)
 

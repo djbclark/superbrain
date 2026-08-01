@@ -13,8 +13,10 @@ boundary, and the next safe actions.
 - Public compliance page and evidence:
   [`docs/youtube-api-compliance.html`](docs/youtube-api-compliance.html) and
   [`docs/compliance-screenshots/`](docs/compliance-screenshots/)
-- YouTube playlist behavior:
+- YouTube playlist behavior (optional feature; skip if unused):
   [`docs/CATEGORY_YOUTUBE_PLAYLISTS.md`](docs/CATEGORY_YOUTUBE_PLAYLISTS.md)
+  — local `~/.superbrain-server` deploy/backfill extras are in a clearly marked
+  section at the bottom of that doc
 - Contribution roadmap:
   [fork issue #3](https://github.com/djbclark/superbrain/issues/3)
 - Proposed YouTube end state:

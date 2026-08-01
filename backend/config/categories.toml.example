@@ -2,7 +2,7 @@
 # Copy to categories.toml and edit for your deployment.
 # The real categories.toml is gitignored and must never be committed.
 #
-# deploy-local.sh does not copy config/*.toml into the runtime, so the live
+# deploy-local (superbrain --deploy-local) does not copy config/*.toml into the runtime, so the live
 # file under ~/.superbrain-server/config/categories.toml is safe from deploys.
 
 [taxonomy]

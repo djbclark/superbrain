@@ -4,16 +4,6 @@ Welcome to the SuperBrain documentation! This folder contains all detailed guide
 
 ---
 
-## Active Work and YouTube API Compliance
-
-- **[Session Handoff](SESSION_HANDOFF.md)** - Current upstream reviews, contribution sequence, and resume instructions
-- **[YouTube API Quota Handoff](YOUTUBE_API_QUOTA_HANDOFF.md)** - Public form answers, quota rationale, evidence, and resubmission checklist
-- **[YouTube API Compliance Assets](compliance-screenshots/README.md)** - Exact submitted screenshots and supporting diagrams
-
-AI coding agents should begin with **[AGENTS.md](../AGENTS.md)** in the repository root.
-
----
-
 ## 🚀 Getting Started
 
 - **[QUICKSTART.md](QUICKSTART.md)** - Get up and running in 5 minutes
@@ -49,6 +39,21 @@ AI coding agents should begin with **[AGENTS.md](../AGENTS.md)** in the reposito
 
 ---
 
+## Optional: fork local runtime & category YouTube playlists
+
+> **Skip this section** unless you use this fork’s `~/.superbrain-server`
+> LaunchAgent runtime, category→YouTube playlist sync, or YouTube API quota /
+> compliance work.
+
+- **[Category → YouTube playlists](CATEGORY_YOUTUBE_PLAYLISTS.md)** — `superbrain` CLI; local-runtime extras are sectioned at the bottom
+- **[Session Handoff](SESSION_HANDOFF.md)** — active upstream reviews / resume instructions
+- **[YouTube API Quota Handoff](YOUTUBE_API_QUOTA_HANDOFF.md)** — public form answers and checklist
+- **[YouTube API Compliance Assets](compliance-screenshots/README.md)** — screenshots and diagrams
+- **[Recategorize cookbook](RECATEGORIZE.md)** — taxonomy migration
+- Agent entry: **[AGENTS.md](../AGENTS.md)**
+
+---
+
 ## 🔍 Finding What You Need
 
 ### I want to...
@@ -79,6 +84,9 @@ AI coding agents should begin with **[AGENTS.md](../AGENTS.md)** in the reposito
 
 **...understand security**
 → Read [SECURITY.md](../SECURITY.md) in root
+
+**...use category→YouTube playlists / this fork’s local runtime**
+→ Read [CATEGORY_YOUTUBE_PLAYLISTS.md](CATEGORY_YOUTUBE_PLAYLISTS.md) (optional section above)
 
 ---
 
@@ -139,6 +147,7 @@ These files are in the project root for GitHub/repository visibility:
 | How to contribute? | [../CONTRIBUTING.md](../CONTRIBUTING.md) |
 | Security info? | [../SECURITY.md](../SECURITY.md) |
 | Quick lookup? | [Quick Reference](QUICK_REFERENCE.md) |
+| Category playlists (optional) | [CATEGORY_YOUTUBE_PLAYLISTS.md](CATEGORY_YOUTUBE_PLAYLISTS.md) |
 
 ---
 

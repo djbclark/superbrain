@@ -89,14 +89,26 @@ async def verify_token(request: Request, x_api_key: str = Header(None, descripti
 
 @asynccontextmanager
 async def app_lifespan(application: FastAPI):
-    """Run one non-blocking WebSub renewal leader across Uvicorn workers."""
+    """WebSub renewal leader + optional category playlist backfill supervisor."""
     lock_file = _try_acquire_websub_leader_lock()
     renewal_task = None
     if lock_file is not None:
         renewal_task = asyncio.create_task(_websub_renewal_loop())
     try:
+        from core.playlist_backfill_service import start_api_backfill_supervisor
+
+        start_api_backfill_supervisor()
+    except Exception:
+        logger.exception("Failed to start category playlist backfill supervisor")
+    try:
         yield
     finally:
+        try:
+            from core.playlist_backfill_service import stop_api_backfill_supervisor
+
+            stop_api_backfill_supervisor()
+        except Exception:
+            logger.exception("Failed to stop category playlist backfill supervisor")
         if renewal_task is not None:
             renewal_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -2600,7 +2612,8 @@ async def youtube_oauth_callback(code: str = "", state: str = "", error: str = "
             f"<p>Category playlists ready: {created} created, {adopted} adopted, "
             f"{mapped} already mapped.</p>"
             "<p>Optional backfill of existing videos: "
-            "<code>superbrain --sync-category-playlists</code>.</p>"
+            "<code>superbrain --sync-category-playlists-start</code> "
+            "(or one-shot <code>superbrain --sync-category-playlists</code>).</p>"
         )
     except Exception as exc:
         logger.warning("Enabled playlist sync config but ensure failed: %s", exc)
@@ -2646,6 +2659,7 @@ async def category_playlists_status(token: str = Depends(verify_token)):
         pacific_day_key,
         hours_until_pacific_midnight,
     )
+    from core.playlist_backfill_service import backfill_service_status
     from core.taxonomy import get_taxonomy
     from core.youtube_quota import usage_summary
 
@@ -2676,7 +2690,27 @@ async def category_playlists_status(token: str = Depends(verify_token)):
         "usage": usage_summary(db, day_key=day),
         "mappings": db.list_category_youtube_playlists(),
         "unsynced_estimate": len(fetch_unsynced_playlist_rows(db)),
+        "backfill": backfill_service_status(),
     }
+
+
+@app.post("/api/youtube/category-playlists/backfill/start")
+async def category_playlists_backfill_start(token: str = Depends(verify_token)):
+    """
+    Enable reboot-safe historic backfill (writes config flag; API supervises worker).
+    Same pattern as config/ngrok_enabled.txt — presence means on.
+    """
+    from core.playlist_backfill_service import start_category_playlist_backfill
+
+    return await asyncio.to_thread(start_category_playlist_backfill)
+
+
+@app.post("/api/youtube/category-playlists/backfill/stop")
+async def category_playlists_backfill_stop(token: str = Depends(verify_token)):
+    """Cancel historic backfill (removes config flag and stops the worker)."""
+    from core.playlist_backfill_service import stop_category_playlist_backfill
+
+    return await asyncio.to_thread(stop_category_playlist_backfill)
 
 
 @app.get("/api/youtube/quota/stats")

@@ -20,6 +20,7 @@
 │                                                                            │
 │  analyzers/*           YouTube, webpage, visual, audio, music, text        │
 │  scripts/deploy-local.sh   Allow-listed rsync → ~/.superbrain-server       │
+│                            (operator: superbrain --deploy-local)           │
 │  scripts/recategorize.py   Backup / dry-run / apply / rollback migration   │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -38,7 +39,7 @@
 | `websub_notifier.py` | YouTube WebSub hub handling | `core/` |
 | `category_manager.py` | **Deprecated** — do not use | `core/` |
 | `recategorize.py` | Metadata-only category migration CLI | `scripts/` |
-| `deploy-local.sh` | Deploy reviewed code to runtime dir | `scripts/` |
+| `deploy-local.sh` | Deploy reviewed code to runtime dir | `scripts/` (via `superbrain --deploy-local`) |
 
 ## Category taxonomy
 
@@ -57,6 +58,9 @@
 
 ```bash
 backend/scripts/deploy-local.sh [--restart]
+# preferred:
+superbrain --deploy-local
+superbrain --deploy-local --restart
 ```
 
 Copies allow-listed application files into

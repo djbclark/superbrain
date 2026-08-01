@@ -1549,6 +1549,7 @@ def print_category_playlists_status() -> int:
 
     from core.cli_locks import CliLockUnavailable, exclusive_cli_lock
     from core.database import Database
+    from core.playlist_backfill_service import backfill_service_status
     from core.taxonomy import get_taxonomy
     from core.youtube_quota import usage_summary
 
@@ -1602,6 +1603,7 @@ def print_category_playlists_status() -> int:
                         "oauth_refresh_token_set": bool(
                             os.getenv("YOUTUBE_OAUTH_REFRESH_TOKEN")
                         ),
+                        "backfill": backfill_service_status(),
                     },
                     indent=2,
                 )
