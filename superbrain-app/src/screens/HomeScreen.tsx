@@ -76,8 +76,6 @@ const HomeScreen = () => {
   const [onboardingStep, setOnboardingStep] = useState(0);
   const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
   const lastFocusRefreshRef = useRef(0);
-  /** Caches the GET /taxonomy result within a single loadPosts call. */
-  const taxonomyRef = useRef<TaxonomyPayload | null | undefined>(undefined);
 
   useEffect(() => {
     const bootstrap = async () => {
@@ -308,23 +306,26 @@ const HomeScreen = () => {
     forceRefresh: boolean = false,
     prefetchedTaxonomy?: TaxonomyPayload | null | Promise<TaxonomyPayload | null>,
   ) => {
-    // Reset taxonomy cache for this load cycle; resolved lazily (below) at
-    // whichever point in this function first actually needs it, not eagerly
-    // here — keeps the fast local-data paint path (right below) unblocked by
-    // any network call, including a caller-supplied prefetch promise.
-    taxonomyRef.current = undefined;
+    // Resolved lazily (below) at whichever point in this function first
+    // actually needs it, not eagerly here — keeps the fast local-data paint
+    // path (right below) unblocked by any network call, including a
+    // caller-supplied prefetch promise. `taxonomyCache` is a local (not a
+    // ref) so it's scoped to this single loadPosts call — overlapping calls
+    // (focus listener vs. poll-interval refresh) each get their own cache
+    // instead of racing to reset/read a shared one.
+    let taxonomyCache: TaxonomyPayload | null | undefined = undefined;
     // Resolves the taxonomy exactly once per loadPosts call, reusing
-    // taxonomyRef.current if a previous call site within this same cycle
-    // already resolved it, otherwise awaiting prefetchedTaxonomy (a caller's
+    // taxonomyCache if a previous call site within this same cycle already
+    // resolved it, otherwise awaiting prefetchedTaxonomy (a caller's
     // in-flight fetch, e.g. bootstrap sharing one /taxonomy call with
     // loadCategories instead of each independently re-fetching), otherwise
     // fetching fresh.
     const resolveTaxonomy = async (): Promise<TaxonomyPayload | null> => {
-      if (taxonomyRef.current !== undefined) return taxonomyRef.current;
+      if (taxonomyCache !== undefined) return taxonomyCache;
       const resolved = prefetchedTaxonomy !== undefined
         ? await prefetchedTaxonomy
         : await apiService.getTaxonomy().catch(() => null);
-      taxonomyRef.current = resolved;
+      taxonomyCache = resolved;
       return resolved;
     };
     try {

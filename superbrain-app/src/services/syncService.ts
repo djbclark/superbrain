@@ -60,15 +60,18 @@ async function deltaSync(): Promise<number> {
   // Fetch every changed row before advancing the cursor. A single delta can
   // exceed the server's page size after a large playlist import.
   //
-  // Defensive against a server that doesn't implement `offset` (this PR adds
-  // client-side pagination without a matching backend change — if `/sync`
-  // silently ignores an unknown `offset` param and keeps returning the same
-  // page, `hasMore`'s length-based fallback would never go false and this
-  // loop would never terminate). Two independent safety nets:
+  // `/sync` now honors `offset` and returns real `has_more` (backend/api.py),
+  // but the client stays defensive against any server that doesn't — an
+  // `offset`-blind `/sync` would return the same page forever, and
+  // `hasMore`'s length-based fallback would never go false. Two independent
+  // safety nets, both against a server that ignores/lacks `offset` support:
   //   1. Hard cap on page count — always terminates regardless of server behavior.
   //   2. Non-advancing-cursor detection — if consecutive pages start with the
   //      same post, the server isn't honoring `offset`; stop and warn rather
   //      than loop forever accumulating duplicates.
+  // Either safety net stopping early leaves `paginationComplete` false, so the
+  // cursor doesn't advance and the next sync retries the same window — no
+  // permanent stall, just a delayed catch-up once offset support is correct.
   const MAX_SYNC_PAGES = 50; // 50 * BATCH_SIZE(200) = 10,000 posts per delta sync
   const changedPosts: Post[] = [];
   let offset = 0;
@@ -76,6 +79,10 @@ async function deltaSync(): Promise<number> {
   let paginationComplete = false;
   for (let pageNum = 0; pageNum < MAX_SYNC_PAGES; pageNum++) {
     const page = await apiService.syncPosts(since, BATCH_SIZE, offset);
+    if (page.failed) {
+      console.warn('[Sync] Delta sync page fetch failed — stopping this cycle without advancing the cursor');
+      break;
+    }
     if (page.data.length === 0) {
       paginationComplete = true;
       break;
@@ -97,7 +104,7 @@ async function deltaSync(): Promise<number> {
   }
   if (!paginationComplete) {
     console.warn(
-      `[Sync] Delta sync stopped before fetching all changes (page cap or non-advancing cursor) — ` +
+      `[Sync] Delta sync stopped before fetching all changes (page cap, non-advancing cursor, or fetch failure) — ` +
       `lastSyncTime will NOT advance, so the next sync retries this same window from '${since}'.`
     );
   }
