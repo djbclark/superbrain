@@ -59,13 +59,52 @@ async function deltaSync(): Promise<number> {
 
   // Fetch every changed row before advancing the cursor. A single delta can
   // exceed the server's page size after a large playlist import.
+  //
+  // Two independent safety nets against a server that ignores/lacks `offset`
+  // support (an `offset`-blind `/sync` would return the same page forever,
+  // and `hasMore`'s length-based fallback would never go false):
+  //   1. Hard cap on page count — always terminates regardless of server behavior.
+  //   2. Non-advancing-cursor detection — if consecutive pages start with the
+  //      same post, the server isn't honoring `offset`; stop and warn rather
+  //      than loop forever accumulating duplicates.
+  // Either safety net stopping early leaves `paginationComplete` false, so the
+  // cursor doesn't advance and the next sync retries the same window — no
+  // permanent stall, just a delayed catch-up once offset support is correct.
+  const MAX_SYNC_PAGES = 50; // 50 * BATCH_SIZE(200) = 10,000 posts per delta sync
   const changedPosts: Post[] = [];
   let offset = 0;
-  while (true) {
+  let previousFirstShortcode: string | undefined;
+  let paginationComplete = false;
+  for (let pageNum = 0; pageNum < MAX_SYNC_PAGES; pageNum++) {
     const page = await apiService.syncPosts(since, BATCH_SIZE, offset);
+    if (page.failed) {
+      console.warn('[Sync] Delta sync page fetch failed — stopping this cycle without advancing the cursor');
+      break;
+    }
+    if (page.data.length === 0) {
+      paginationComplete = true;
+      break;
+    }
+    const firstShortcode = page.data[0].shortcode;
+    if (firstShortcode === previousFirstShortcode) {
+      console.warn(
+        '[Sync] Pagination cursor did not advance (server may not support offset) — stopping delta sync early'
+      );
+      break;
+    }
+    previousFirstShortcode = firstShortcode;
     changedPosts.push(...page.data);
     offset += page.data.length;
-    if (!page.hasMore || page.data.length === 0) break;
+    if (!page.hasMore) {
+      paginationComplete = true;
+      break;
+    }
+  }
+  if (!paginationComplete) {
+    console.warn(
+      `[Sync] Delta sync stopped before fetching all changes (page cap, non-advancing cursor, or fetch failure) — ` +
+      `lastSyncTime will NOT advance, so the next sync retries this same window from '${since}'.`
+    );
   }
 
   // Filter out hidden (soft-deleted) posts for upsert; delete them locally instead
@@ -93,8 +132,12 @@ async function deltaSync(): Promise<number> {
     await localDb.deletePosts(deletedShortcodes);
   }
 
-  // Update sync cursor
-  await localDb.setLastSyncTime(new Date().toISOString());
+  // Update sync cursor — only when pagination genuinely completed. Advancing
+  // this after an incomplete cycle (page cap / non-advancing cursor) would
+  // permanently skip whatever changes existed past the point sync stopped.
+  if (paginationComplete) {
+    await localDb.setLastSyncTime(new Date().toISOString());
+  }
 
   const totalChanges = toUpsert.length + deletedShortcodes.length;
   if (totalChanges > 0) {

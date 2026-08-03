@@ -853,15 +853,15 @@ async def sync_posts(
     """
     try:
         db = get_db()
-        results = db.get_posts_since(since, limit=limit, offset=offset)
+        results, has_more = db.get_posts_since(since, limit=limit, offset=offset)
 
         return {
             "success": True,
             "count": len(results),
             "since": since,
             "offset": offset,
-            "next_offset": offset + len(results) if len(results) == limit else None,
-            "has_more": len(results) == limit,
+            "next_offset": offset + len(results) if has_more else None,
+            "has_more": has_more,
             "data": results
         }
 

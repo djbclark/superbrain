@@ -310,7 +310,7 @@ class ApiService {
     since: string,
     limit: number = 200,
     offset: number = 0,
-  ): Promise<{ data: Post[]; hasMore: boolean }> {
+  ): Promise<{ data: Post[]; hasMore: boolean; failed?: boolean }> {
     try {
       const headers = await this.getHeaders();
       const baseUrl = await this.getBaseUrl();
@@ -327,7 +327,9 @@ class ApiService {
       };
     } catch (error: any) {
       console.error('Error syncing posts:', error.response?.data?.detail || error.message);
-      return { data: [], hasMore: false };
+      // `failed: true` distinguishes a transient fetch error from a legitimate
+      // empty/final page — callers must not treat this as "sync complete".
+      return { data: [], hasMore: false, failed: true };
     }
   }
 
@@ -421,7 +423,7 @@ class ApiService {
       const baseUrl = await this.getBaseUrl();
       const response = await axios.get<{
         success: boolean;
-        categories: Array<{ id: string; name: string; precedence: number; guidance: string }>;
+        categories: Array<{ id: string; name: string; precedence?: number; guidance?: string }>;
         allow_multiple_categories: boolean;
         fallback_category: string;
         use_default_categories: boolean;

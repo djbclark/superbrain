@@ -628,22 +628,27 @@ class Database:
             return []
 
     def get_posts_since(self, updated_after: str, limit=1000, offset=0):
-        """Return posts updated after the given ISO timestamp (delta sync).
-        Includes soft-deleted posts so the app knows to hide them."""
+        """Return posts updated after the given ISO timestamp (delta sync), paginated.
+        Includes soft-deleted posts so the app knows to hide them.
+        Returns (results, has_more) — has_more indicates additional pages remain."""
         if not self.is_connected():
-            return []
+            return [], False
         try:
             cur = self._conn.cursor()
+            # updated_at alone isn't a stable ORDER BY/OFFSET key when rows share a
+            # timestamp; shortcode (primary key) breaks ties so paging is deterministic.
             cur.execute(
                 f"SELECT {self.LIGHT_COLUMNS} FROM analyses "
                 "WHERE updated_at > ? "
-                "ORDER BY updated_at ASC LIMIT ? OFFSET ?",
-                (updated_after, limit, offset)
+                "ORDER BY updated_at ASC, shortcode ASC LIMIT ? OFFSET ?",
+                (updated_after, limit + 1, offset)
             )
-            return [self._row_to_dict(r) for r in cur.fetchall()]
+            rows = cur.fetchall()
+            has_more = len(rows) > limit
+            return [self._row_to_dict(r) for r in rows[:limit]], has_more
         except Exception as e:
             print(f"[WARNING]  Error getting posts since {updated_after}: {e}")
-            return []
+            return [], False
 
     def get_deleted_since(self, since: str):
         """Return shortcodes of posts deleted after the given ISO timestamp."""

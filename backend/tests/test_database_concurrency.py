@@ -59,13 +59,17 @@ class TestDatabaseConcurrency(unittest.TestCase):
             for index in range(3):
                 self.assertTrue(self._save(index))
 
-        first_page = self.db.get_posts_since("2000-01-01T00:00:00", limit=2)
-        second_page = self.db.get_posts_since(
+        first_page, first_has_more = self.db.get_posts_since(
+            "2000-01-01T00:00:00", limit=2
+        )
+        second_page, second_has_more = self.db.get_posts_since(
             "2000-01-01T00:00:00", limit=2, offset=2
         )
 
         self.assertEqual(len(first_page), 2)
+        self.assertTrue(first_has_more)
         self.assertEqual(len(second_page), 1)
+        self.assertFalse(second_has_more)
         self.assertEqual(
             {row["shortcode"] for first in [first_page] for row in first}
             .isdisjoint({row["shortcode"] for row in second_page}),
