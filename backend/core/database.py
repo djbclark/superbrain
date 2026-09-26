@@ -1882,6 +1882,114 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # ------------------------------------------------------------------
+    # WAL management
+    # ------------------------------------------------------------------
+
+    # Default threshold: checkpoint when WAL exceeds 200 MB
+    try:
+        WAL_CHECKPOINT_THRESHOLD_BYTES = int(
+            os.getenv("SUPERBRAIN_WAL_CHECKPOINT_THRESHOLD_MB", "200")
+        ) * 1024 * 1024
+    except ValueError:
+        WAL_CHECKPOINT_THRESHOLD_BYTES = 200 * 1024 * 1024
+
+    def wal_stats(self):
+        """Return WAL and database file sizes in bytes.
+
+        Returns a dict with keys:
+          db_bytes: main database file size
+          wal_bytes: WAL file size (0 if absent)
+          shm_bytes: shared-memory file size (0 if absent)
+          total_bytes: sum of all three
+          wal_page_count: estimated number of pages in the WAL (assuming 4KB pages)
+          threshold_bytes: configured auto-checkpoint threshold
+        """
+        db_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
+        wal_path = Path(str(self.db_path) + "-wal")
+        shm_path = Path(str(self.db_path) + "-shm")
+        wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+        shm_bytes = shm_path.stat().st_size if shm_path.exists() else 0
+
+        # Estimate page count (SQLite default page size is 4096)
+        # We avoid PRAGMA wal_checkpoint(PASSIVE) here because it writes to the DB.
+        wal_page_count = wal_bytes // 4096
+
+        return {
+            "db_bytes": db_bytes,
+            "wal_bytes": wal_bytes,
+            "shm_bytes": shm_bytes,
+            "total_bytes": db_bytes + wal_bytes + shm_bytes,
+            "wal_page_count": wal_page_count,
+            "threshold_bytes": self.WAL_CHECKPOINT_THRESHOLD_BYTES,
+        }
+
+    def wal_checkpoint(self, *, force=False):
+        """Checkpoint and truncate the WAL file if it exceeds the threshold.
+
+        Args:
+            force: if True, checkpoint regardless of WAL size.
+
+        Returns a dict with:
+          checkpointed: whether a TRUNCATE checkpoint was performed
+          wal_bytes_before: WAL size before the attempt
+          wal_bytes_after: WAL size after (0 on success)
+          busy: number of pages that could not be checkpointed
+          log_pages: total pages in the WAL before checkpoint
+          checkpointed_pages: pages successfully checkpointed
+          error: error message if the checkpoint failed (None otherwise)
+        """
+        wal_path = Path(str(self.db_path) + "-wal")
+        wal_before = wal_path.stat().st_size if wal_path.exists() else 0
+
+        if not force and wal_before < self.WAL_CHECKPOINT_THRESHOLD_BYTES:
+            return {
+                "checkpointed": False,
+                "wal_bytes_before": wal_before,
+                "wal_bytes_after": wal_before,
+                "reason": "below_threshold",
+                "busy": 0,
+                "log_pages": 0,
+                "checkpointed_pages": 0,
+                "error": None,
+            }
+
+        error = None
+        busy = log_pages = checkpointed_pages = 0
+        try:
+            row = self._conn.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if row:
+                busy, log_pages, checkpointed_pages = row[0], row[1], row[2]
+        except Exception as exc:
+            error = str(exc)
+
+        wal_after = wal_path.stat().st_size if wal_path.exists() else 0
+
+        result = {
+            "checkpointed": True,
+            "wal_bytes_before": wal_before,
+            "wal_bytes_after": wal_after,
+            "reason": "forced" if force else "exceeded_threshold",
+            "busy": busy or 0,
+            "log_pages": log_pages or 0,
+            "checkpointed_pages": checkpointed_pages or 0,
+            "error": error,
+        }
+
+        if error:
+            print(f"[WARNING]  WAL checkpoint error: {error}")
+        else:
+            saved_mb = (wal_before - wal_after) / (1024 * 1024)
+            print(
+                f"[OK] WAL checkpoint: {wal_before / (1024*1024):.1f} MB → "
+                f"{wal_after / (1024*1024):.1f} MB (freed {saved_mb:.1f} MB, "
+                f"{checkpointed_pages}/{log_pages} pages)"
+            )
+
+        return result
+
     def prune_youtube_api_usage_events(self, *, keep_days: int = 90) -> int:
         keep_days = max(1, int(keep_days))
         from datetime import datetime, timedelta

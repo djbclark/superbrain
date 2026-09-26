@@ -89,11 +89,12 @@ async def verify_token(request: Request, x_api_key: str = Header(None, descripti
 
 @asynccontextmanager
 async def app_lifespan(application: FastAPI):
-    """WebSub renewal leader + optional category playlist backfill supervisor."""
+    """WebSub renewal leader + optional category playlist backfill supervisor + WAL checkpoint."""
     lock_file = _try_acquire_websub_leader_lock()
     renewal_task = None
     if lock_file is not None:
         renewal_task = asyncio.create_task(_websub_renewal_loop())
+    wal_task = asyncio.create_task(_wal_checkpoint_loop())
     try:
         from core.playlist_backfill_service import start_api_backfill_supervisor
 
@@ -109,6 +110,9 @@ async def app_lifespan(application: FastAPI):
             stop_api_backfill_supervisor()
         except Exception:
             logger.exception("Failed to stop category playlist backfill supervisor")
+        wal_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await wal_task
         if renewal_task is not None:
             renewal_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -902,11 +906,13 @@ async def get_database_stats(token: str = Depends(verify_token)):
     - Storage usage
     - Category breakdown
     - Capacity information
+    - WAL file status
     - Requires API authentication
     """
     try:
         db = get_db()
-        stats = db.get_stats()
+        stats = await asyncio.to_thread(db.get_stats)
+        stats["wal"] = await asyncio.to_thread(db.wal_stats)
 
         return {
             "success": True,
@@ -1267,12 +1273,14 @@ async def health_check(token: str = Depends(verify_token)):
     """API health check with database connectivity test (requires auth)"""
     try:
         db = get_db()
-        stats = db.get_stats()
+        stats = await asyncio.to_thread(db.get_stats)
+        wal = await asyncio.to_thread(db.wal_stats)
 
         return {
             "status": "healthy",
             "database": "connected",
             "documents": stats.get('document_count', 0),
+            "wal_mb": round(wal["wal_bytes"] / (1024 * 1024), 1),
             "timestamp": datetime.now().isoformat()
         }
 
@@ -2262,6 +2270,51 @@ async def _reconcile_websub_subscriptions_once():
         stats["fetched"], stats["channels"], stats["queued"], stats["failed"],
     )
     return stats
+
+
+# ------------------------------------------------------------------
+# WAL auto-checkpoint loop
+# ------------------------------------------------------------------
+
+try:
+    _WAL_CHECKPOINT_INTERVAL_SECONDS = int(
+        os.getenv("SUPERBRAIN_WAL_CHECKPOINT_INTERVAL_SECONDS", "300")
+    )
+    if _WAL_CHECKPOINT_INTERVAL_SECONDS <= 0:
+        _WAL_CHECKPOINT_INTERVAL_SECONDS = 300
+except ValueError:
+    _WAL_CHECKPOINT_INTERVAL_SECONDS = 300
+
+
+async def _wal_checkpoint_loop():
+    """Periodically checkpoint the WAL to prevent unbounded file growth.
+
+    Runs every SUPERBRAIN_WAL_CHECKPOINT_INTERVAL_SECONDS (default 300 = 5 min).
+    Only performs a TRUNCATE checkpoint when the WAL exceeds the threshold
+    (default 200 MB, set via SUPERBRAIN_WAL_CHECKPOINT_THRESHOLD_MB).
+    """
+    # Small initial delay so the server finishes startup first.
+    await asyncio.sleep(10)
+    while True:
+        try:
+            database = get_db()
+            result = await asyncio.to_thread(database.wal_checkpoint)
+            if result["checkpointed"]:
+                if result["error"]:
+                    logger.warning(
+                        "⚠️ WAL checkpoint error: %s (WAL=%d MB)",
+                        result["error"],
+                        result["wal_bytes_after"] / (1024 * 1024),
+                    )
+                else:
+                    logger.info(
+                        "✅ WAL checkpoint: %.1f MB → %.1f MB",
+                        result["wal_bytes_before"] / (1024 * 1024),
+                        result["wal_bytes_after"] / (1024 * 1024),
+                    )
+        except Exception as exc:
+            logger.warning("⚠️ WAL checkpoint loop error: %s", exc)
+        await asyncio.sleep(_WAL_CHECKPOINT_INTERVAL_SECONDS)
 
 
 async def _websub_renewal_loop():

@@ -37,6 +37,10 @@ class Settings:
     # SQLite WAL mode for better concurrency
     ENABLE_WAL: bool = True
     
+    # Auto-checkpoint settings to prevent unbounded WAL growth
+    SUPERBRAIN_WAL_CHECKPOINT_THRESHOLD_MB: int = int(os.getenv("SUPERBRAIN_WAL_CHECKPOINT_THRESHOLD_MB", 200))
+    SUPERBRAIN_WAL_CHECKPOINT_INTERVAL_SECONDS: int = int(os.getenv("SUPERBRAIN_WAL_CHECKPOINT_INTERVAL_SECONDS", 300))
+    
     # ──────────────────────────────────────────────────────────────────────────
     # Security & Authentication
     # ──────────────────────────────────────────────────────────────────────────
