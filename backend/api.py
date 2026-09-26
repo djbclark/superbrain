@@ -2777,6 +2777,11 @@ async def category_playlists_sync_one(shortcode: str, token: str = Depends(verif
 if __name__ == "__main__":
     import uvicorn
     print("🚀 Starting SuperBrain API...")
-    print("📖 API Docs: http://localhost:5000/docs")
-    print("🔍 Interactive: http://localhost:5000/redoc")
-    uvicorn.run("api:app", host="0.0.0.0", port=5000, reload=False)
+    # PORT env (default 5000). macOS AirPlay Receiver (ControlCenter) owns *:5000 and
+    # *:7000; with the default this service crash-looped under launchd for 31 h
+    # (2026-09-26). The launchd plist sets PORT=5001; the 8443 Tailscale funnel path
+    # /api/youtube/webhook points there too.
+    port = int(os.environ.get("PORT", "5000"))
+    print(f"📖 API Docs: http://localhost:{port}/docs")
+    print(f"🔍 Interactive: http://localhost:{port}/redoc")
+    uvicorn.run("api:app", host="0.0.0.0", port=port, reload=False)
