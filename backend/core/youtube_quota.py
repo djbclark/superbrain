@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -233,6 +234,77 @@ def classify_result(
         return "error"
     return "ok"
 
+class _TransportErrorBatcher:
+    """Batch consecutive transport errors into single summary events."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending = {}
+        self._last_flush = time.monotonic()
+        self._flush_interval = 300.0  # 5 minutes
+
+    def record(self, db, event: dict):
+        now = time.monotonic()
+        with self._lock:
+            key = (event["resource"], event["method"], event["operation"], event["priority"])
+            if key not in self._pending:
+                self._pending[key] = {
+                    "count": 0,
+                    "duration_ms": 0,
+                    "error_classes": set(),
+                    "units_known": event["units_known"],
+                }
+            entry = self._pending[key]
+            entry["count"] += 1
+            if event["duration_ms"]:
+                entry["duration_ms"] = max(entry["duration_ms"], event["duration_ms"])
+            if event["error_class"]:
+                entry["error_classes"].add(event["error_class"])
+                
+            should_flush = (now - self._last_flush >= self._flush_interval)
+            
+        if should_flush:
+            self._flush(db)
+
+    def _flush(self, db):
+        with self._lock:
+            if not self._pending:
+                self._last_flush = time.monotonic()
+                return
+            to_flush = self._pending
+            self._pending = {}
+            self._last_flush = time.monotonic()
+            
+        day = pacific_day_key()
+        for (resource, method, operation, priority), entry in to_flush.items():
+            try:
+                db.insert_youtube_api_usage_event(
+                    day_key=day,
+                    resource=resource,
+                    method=method,
+                    result_class="transport_error",
+                    units=0,
+                    units_known=entry["units_known"],
+                    duration_ms=entry["duration_ms"],
+                    operation=operation,
+                    job_id="batched",
+                    retry_count=entry["count"],
+                    error_class=",".join(sorted(entry["error_classes"])),
+                    cost_table_version=COST_TABLE_VERSION,
+                    priority=priority,
+                )
+            except Exception:
+                pass  # Partial failure does not re-emit committed rows.
+
+    def clear(self):
+        with self._lock:
+            self._pending.clear()
+            self._last_flush = time.monotonic()
+
+_batcher = _TransportErrorBatcher()
+
+def flush_youtube_quota_batcher(db):
+    """Force flush of batched transport errors to the DB."""
+    _batcher._flush(db)
 
 def record_youtube_api_call(
     db,
@@ -291,16 +363,19 @@ def record_youtube_api_call(
         "cost_table_version": COST_TABLE_VERSION,
         "priority": "new" if priority == "new" else "historic",
     }
-    db.insert_youtube_api_usage_event(**event)
-
-    if update_ledger and units > 0 and not transport_miss:
-        db.record_youtube_quota_spend(
-            day,
-            units=units,
-            priority=event["priority"],
-        )
-        if result == "quota_error":
-            db.mark_youtube_quota_exhausted(day)
+    
+    if transport_miss:
+        _batcher.record(db, event)
+    else:
+        db.insert_youtube_api_usage_event(**event)
+        if update_ledger and units > 0:
+            db.record_youtube_quota_spend(
+                day,
+                units=units,
+                priority=event["priority"],
+            )
+            if result == "quota_error":
+                db.mark_youtube_quota_exhausted(day)
 
     return event
 
@@ -402,6 +477,8 @@ def instrumented_request(
 
 def usage_summary(db, *, day_key: Optional[str] = None, days: int = 1) -> dict[str, Any]:
     """Aggregate usage for one Pacific day or a rolling window of days."""
+    flush_youtube_quota_batcher(db)
+    
     day = day_key or pacific_day_key()
     if days <= 1:
         rows = db.summarize_youtube_api_usage(day_key=day)

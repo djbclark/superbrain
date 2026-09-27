@@ -59,6 +59,8 @@ class TestUsageEvents(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = Database(db_path=Path(self.tmp.name) / "u.db")
+        from core.youtube_quota import _batcher
+        _batcher.clear()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -164,10 +166,14 @@ class TestUsageEvents(unittest.TestCase):
                     priority="new",
                 )
 
+        from core.youtube_quota import flush_youtube_quota_batcher
+        flush_youtube_quota_batcher(self.db)
         summary = usage_summary(self.db)
-        self.assertEqual(summary["totals"]["calls"], 6)
+        # Because we batch transport errors, 6 identical transport errors = 1 db row with retry_count=6.
+        self.assertEqual(summary["totals"]["calls"], 1)
         self.assertEqual(summary["totals"]["units"], 0)
-        self.assertEqual(summary["totals"]["failed"], 6)
+        self.assertEqual(summary["totals"]["failed"], 1)
+        self.assertEqual(summary["totals"]["retries"], 6)
         ledger = self.db.get_youtube_quota_ledger(summary["day_key"])
         self.assertTrue(
             ledger is None or int(ledger.get("units_used") or 0) == 0,

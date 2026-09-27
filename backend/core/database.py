@@ -367,10 +367,6 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_yt_usage_day
                 ON youtube_api_usage_events (day_key, ts);
-            CREATE INDEX IF NOT EXISTS idx_yt_usage_endpoint
-                ON youtube_api_usage_events (resource, method, day_key);
-            CREATE INDEX IF NOT EXISTS idx_yt_usage_operation
-                ON youtube_api_usage_events (operation, day_key);
         """)
         self._conn.commit()
 

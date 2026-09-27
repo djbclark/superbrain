@@ -95,20 +95,36 @@ async def app_lifespan(application: FastAPI):
     if lock_file is not None:
         renewal_task = asyncio.create_task(_websub_renewal_loop())
     try:
-        from core.playlist_backfill_service import start_api_backfill_supervisor
+        db = get_db()
+        import os
+        retention = int(os.getenv('YOUTUBE_USAGE_RETENTION_DAYS', '90'))
+        deleted = db.prune_youtube_api_usage_events(keep_days=retention)
+        if deleted > 0:
+            logger.info(f"🧹 Pruned {deleted} old YouTube API usage events")
+    except Exception:
+        logger.exception("Failed to prune old youtube usage events")
 
+    try:
+        from core.playlist_backfill_service import start_api_backfill_supervisor
         start_api_backfill_supervisor()
     except Exception:
         logger.exception("Failed to start category playlist backfill supervisor")
+
     try:
         yield
     finally:
         try:
             from core.playlist_backfill_service import stop_api_backfill_supervisor
-
             stop_api_backfill_supervisor()
         except Exception:
             logger.exception("Failed to stop category playlist backfill supervisor")
+            
+        try:
+            from core.youtube_quota import flush_youtube_quota_batcher
+            flush_youtube_quota_batcher(get_db())
+        except Exception:
+            pass
+            
         if renewal_task is not None:
             renewal_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -2720,8 +2736,10 @@ async def youtube_quota_stats(
 ):
     """Durable YouTube Data API usage statistics (estimated units)."""
     from core.youtube_quota import usage_summary
+    import os
 
-    return usage_summary(get_db(), days=max(1, min(90, int(days or 1))))
+    retention = int(os.getenv('YOUTUBE_USAGE_RETENTION_DAYS', '90'))
+    return usage_summary(get_db(), days=max(1, min(retention, int(days or 1))))
 
 
 @app.post("/api/youtube/category-playlists/ensure")
