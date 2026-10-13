@@ -1990,8 +1990,18 @@ class Database:
 
         return result
 
-    def prune_youtube_api_usage_events(self, *, keep_days: int = 90) -> int:
+    def prune_youtube_api_usage_events(
+        self, *, keep_days: int = 90, error_keep_days: int = 7
+    ) -> int:
+        """Delete old usage events; returns the number of rows removed.
+
+        Every event older than ``keep_days`` goes. ``transport_error`` events
+        (the request never reached YouTube, so no quota was spent and the daily
+        ledger already counts units) are kept only ``error_keep_days``: a retry
+        storm once wrote 4.6M of them in a week and grew the database to 1.4 GB.
+        """
         keep_days = max(1, int(keep_days))
+        error_keep_days = max(1, min(int(error_keep_days), keep_days))
         from datetime import datetime, timedelta
 
         try:
@@ -2002,10 +2012,13 @@ class Database:
             from datetime import timezone as _tz
 
             pt = _tz.utc
-        cutoff = (datetime.now(pt) - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+        now = datetime.now(pt)
+        cutoff = (now - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+        error_cutoff = (now - timedelta(days=error_keep_days)).strftime("%Y-%m-%d")
         cur = self._conn.execute(
-            "DELETE FROM youtube_api_usage_events WHERE day_key < ?",
-            (cutoff,),
+            "DELETE FROM youtube_api_usage_events WHERE day_key < ?"
+            " OR (result_class = 'transport_error' AND day_key < ?)",
+            (cutoff, error_cutoff),
         )
         self._conn.commit()
         return cur.rowcount

@@ -95,6 +95,7 @@ async def app_lifespan(application: FastAPI):
     if lock_file is not None:
         renewal_task = asyncio.create_task(_websub_renewal_loop())
     wal_task = asyncio.create_task(_wal_checkpoint_loop())
+    usage_prune_task = asyncio.create_task(_usage_events_prune_loop())
     try:
         from core.playlist_backfill_service import start_api_backfill_supervisor
 
@@ -113,6 +114,9 @@ async def app_lifespan(application: FastAPI):
         wal_task.cancel()
         with suppress(asyncio.CancelledError):
             await wal_task
+        usage_prune_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await usage_prune_task
         if renewal_task is not None:
             renewal_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -2315,6 +2319,26 @@ async def _wal_checkpoint_loop():
         except Exception as exc:
             logger.warning("⚠️ WAL checkpoint loop error: %s", exc)
         await asyncio.sleep(_WAL_CHECKPOINT_INTERVAL_SECONDS)
+
+
+async def _usage_events_prune_loop():
+    """Once a day, drop old youtube_api_usage_events rows.
+
+    Keeps 90 days of events and only 7 days of transport_error events (see
+    Database.prune_youtube_api_usage_events). The rows are deleted, not the
+    file shrunk: the freed pages are reused, and the host's weekly
+    sqlite-vacuum job gives them back to the disk.
+    """
+    await asyncio.sleep(60)
+    while True:
+        try:
+            database = get_db()
+            removed = await asyncio.to_thread(database.prune_youtube_api_usage_events)
+            if removed:
+                logger.info("🧹 Pruned %d old YouTube API usage events", removed)
+        except Exception as exc:
+            logger.warning("⚠️ Usage event prune error: %s", exc)
+        await asyncio.sleep(24 * 60 * 60)
 
 
 async def _websub_renewal_loop():
